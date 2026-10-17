@@ -1,407 +1,733 @@
 // physics_gpu.cu
-// GPU physics implementation compatible with main.cpp API.
-// Uses iterative pairwise position-correction + velocity impulse (atomic-based).
+// CUDA port of the solver in physics_cpu.c, using the same per-body math (contact.h).
+//
+// Each sub-step:
+//   1. k_integrate_hash   integrate, then compute each circle's grid cell (one thread per circle)
+//   2. cub radix sort     sort (cell, index) pairs, only over the bits the cell ids use
+//   3. k_reorder          find each cell's [start, end) range (shared memory) and gather
+//                         every attribute into cell order, so neighbours sit next to each
+//                         other in memory and the solver's loads are coalesced/cache friendly
+//   4. k_solve x N        Jacobi iterations, one thread per circle, reading the 3x3 cells
+//                         around it and writing only its own state: no atomics on bodies
+// The whole frame is captured once into a CUDA Graph and replayed, which removes the
+// per-launch CPU overhead of ~10 kernels per sub-step.
 
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
-#include <stdio.h>
-#include <math.h>
+#include <cub/device/device_radix_sort.cuh>
+
+#include <cstdio>
+#include <cstring>
 
 #include "circle.h"
+#include "contact.h"
 
-// Globals for persistent GPU buffers / interop resource
-static Circle *d_persistent = nullptr;     // persistent device buffer (for interop mode)
-static Circle *d_temp = nullptr;           // temporary device buffer (for GPU copy mode)
-static int g_maxCount = 0;
+namespace {
 
-static cudaGraphicsResource *cuda_vbo_resource = nullptr;
+constexpr int kBlockSize = 256;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = kBlockSize / kWarpSize;
+constexpr uint32_t kEmptyCell = 0xFFFFFFFFu;
 
-// Utility macro for CUDA error checking
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t e = (call); \
-        if (e != cudaSuccess) { \
-            fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
-        } \
-    } while (0)
-
-// Forward declarations (API used by main.cpp)
-
-// -----------------------------
-// Device helpers
-// -----------------------------
-__device__ inline float safe_sqrtf(float x) {
-    return sqrtf(fmaxf(x, 0.0f));
+bool cuda_ok(cudaError_t err, const char *what)
+{
+    if (err == cudaSuccess) return true;
+    std::fprintf(stderr, "CUDA error in %s: %s\n", what, cudaGetErrorString(err));
+    return false;
 }
 
-// Kernel: apply forces (gravity), damping, integrate
-__global__ void kernel_integrate(Circle *circles, int count, float gravity, float damping_base, float dt, float width, float height) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    for (int i = idx; i < count; i += blockDim.x * gridDim.x) {
-        Circle &c = circles[i];
-        // apply gravity
-        c.vy += gravity * dt;
-        // apply damping (frame-rate independent)
-        c.vx *= damping_base;
-        c.vy *= damping_base;
-        // integrate position
-        c.x += c.vx * dt;
-        c.y += c.vy * dt;
+#define CUDA_CHECK(call) cuda_ok((call), #call)
 
-        // Velocity clamp
-        const float max_speed = 600.0f;
-        float speed_sq = c.vx * c.vx + c.vy * c.vy;
-        if (speed_sq > max_speed * max_speed) {
-            float scale = max_speed / safe_sqrtf(speed_sq);
-            c.vx *= scale;
-            c.vy *= scale;
-        }
-
-        // Boundary constraints (naive per-step clamp; further corrected in collision iterations)
-        if (c.x < c.radius) {
-            c.x = c.radius;
-            if (c.vx < 0) c.vx = -c.vx;
-        } else if (c.x > width - c.radius) {
-            c.x = width - c.radius;
-            if (c.vx > 0) c.vx = -c.vx;
-        }
-        if (c.y < c.radius) {
-            c.y = c.radius;
-            if (c.vy < 0) c.vy = -c.vy;
-        } else if (c.y > height - c.radius) {
-            c.y = height - c.radius;
-            if (c.vy > 0) c.vy = -c.vy;
-        }
-    }
-}
-
-// Kernel: pairwise collision correction + velocity impulse
-// Each thread handles a distinct pair index k mapping to (i,j) with i < j
-__global__ void kernel_pairwise_resolve(Circle *circles, int count, float elasticity, float dt) {
-    // linear index for pair
-    unsigned long long k = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned long long total_pairs = (unsigned long long)count * (unsigned long long)(count - 1) / 2ULL;
-    if (k >= total_pairs) return;
-
-    // map k to pair (i, j) such that 0 <= i < j < count
-    // Use triangular mapping: k = i * (count - 1) - i*(i+1)/2 + (j - i - 1)
-    // We'll invert via loop - acceptable since kernel count is large but mapping overhead small.
-    // A faster mapping exists, but this is straightforward and robust.
-    unsigned int i = 0;
-    unsigned long long acc = 0;
-    // Binary search would be faster; do an iterative approach:
-    // Find largest i such that acc + (count - i - 1) > k
-    unsigned int low = 0, high = count - 1;
-    while (low <= high) {
-        unsigned int mid = (low + high) >> 1;
-        unsigned long long pairs_before = (unsigned long long)mid * (unsigned long long)(count - 1) - (unsigned long long)mid * (unsigned long long)(mid + 1) / 2ULL;
-        unsigned long long pairs_upto = pairs_before + (count - mid - 1);
-        if (k < pairs_before) {
-            high = mid - 1;
-        } else if (k >= pairs_upto) {
-            low = mid + 1;
-        } else {
-            i = mid;
-            acc = pairs_before;
-            break;
-        }
-    }
-    unsigned int j = (unsigned int)(i + 1 + (k - acc));
-
-    if (i >= count || j >= count || i == j) return;
-
-    Circle *a = &circles[i];
-    Circle *b = &circles[j];
-
-    // Compute separation
-    float dx = b->x - a->x;
-    float dy = b->y - a->y;
-    float dist_sq = dx * dx + dy * dy;
-    float min_dist = a->radius + b->radius;
-
-    if (dist_sq >= min_dist * min_dist) {
-        return; // no collision
-    }
-
-    float dist = safe_sqrtf(dist_sq);
-    float nx = 1.0f, ny = 0.0f;
-    if (dist > 1e-7f) {
-        nx = dx / dist;
-        ny = dy / dist;
-    } else {
-        // Overlapped exactly - generate small random-ish separation direction using indices
-        float angle = fmodf((float)(i * 2654435761u + j), 31415.9265f) * 1e-4f;
-        nx = cosf(angle); ny = sinf(angle);
-        dist = 0.0f;
-    }
-
-    float penetration = min_dist - dist;
-
-    // Tunable constants tuned to mimic CPU solver
-    const float k_slop = 0.003f;
-    const float k_percent = 0.65f;
-    const float bias_factor = 0.25f;
-    const float v_threshold = 0.02f;
-
-    float invMassA = (a->mass > 0.0f) ? (1.0f / a->mass) : 0.0f;
-    float invMassB = (b->mass > 0.0f) ? (1.0f / b->mass) : 0.0f;
-    float invMassSum = invMassA + invMassB;
-    if (invMassSum <= 0.0f) return;
-
-    // Position correction (mass-weighted)
-    float correction = 0.0f;
-    if (penetration > k_slop) {
-        correction = (penetration - k_slop) * k_percent;
-    }
-
-    float corrA = correction * (invMassA / invMassSum);
-    float corrB = correction * (invMassB / invMassSum);
-
-    // Apply position corrections atomically
-    atomicAdd(&(a->x), -corrA * nx);
-    atomicAdd(&(a->y), -corrA * ny);
-    atomicAdd(&(b->x),  corrB * nx);
-    atomicAdd(&(b->y),  corrB * ny);
-
-    // Relative velocity along normal
-    float dvx = b->vx - a->vx;
-    float dvy = b->vy - a->vy;
-    float dvn = dvx * nx + dvy * ny;
-
-    // Only handle approaching objects
-    if (dvn > -v_threshold) return;
-
-    // Baumgarte bias for velocity
-    float bias = bias_factor * fmaxf(penetration - k_slop, 0.0f) / fmaxf(dt, 1e-6f);
-
-    float effective_elasticity = elasticity * 0.6f;
-
-    float impulse = (-(1.0f + effective_elasticity) * dvn + bias) / invMassSum;
-
-    float jx = impulse * nx;
-    float jy = impulse * ny;
-
-    // Apply impulses atomically (note sign convention)
-    if (invMassA > 0.0f) {
-        atomicAdd(&(a->vx), -invMassA * jx);
-        atomicAdd(&(a->vy), -invMassA * jy);
-    }
-    if (invMassB > 0.0f) {
-        atomicAdd(&(b->vx), invMassB * jx);
-        atomicAdd(&(b->vy), invMassB * jy);
-    }
-}
-
-// Kernel: write circle data into mapped VBO (assumed float4 pos, float4 color/radius etc.)
-// This is generic — adjust in renderer if your VBO format differs.
-struct VBOVertex {
-    float x, y, z, w;
-    float r, g, b, a;
+struct Grid {
+    float invCellSize;
+    int   width;
+    int   height;
 };
 
-__global__ void kernel_write_vbo(Circle *circles, int count, VBOVertex *vbo) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    for (int i = idx; i < count; i += blockDim.x * gridDim.x) {
-        Circle &c = circles[i];
-        VBOVertex v;
-        v.x = c.x;
-        v.y = c.y;
-        v.z = 0.0f;
-        v.w = c.radius; // use w to carry radius
-        v.r = c.r;
-        v.g = c.g;
-        v.b = c.b;
-        v.a = 1.0f;
-        vbo[i] = v;
+// Everything a captured graph bakes in. Compared with memcmp, so it is
+// zero-initialised before being filled.
+struct FrameConfig {
+    SimParams params;
+    float     dt;
+    int       count;
+    int       posCur;
+    int       attrCur;
+};
+
+struct GraphEntry {
+    cudaGraphExec_t exec = nullptr;
+    FrameConfig     config;
+    int             endPosCur = 0;
+    int             endAttrCur = 0;
+};
+
+struct GpuState {
+    bool initialized = false;
+    char deviceName[320] = "none";
+    int  capacity = 0;
+    int  count = 0;
+
+    cudaStream_t stream = nullptr;
+
+    // Structure-of-arrays state, double buffered. Positions/velocities ping-pong
+    // every solver iteration; the other attributes only move during the reorder.
+    float2   *pos[2] = {};
+    float2   *vel[2] = {};
+    float    *radius[2] = {};
+    float    *invMass[2] = {};
+    uint32_t *color[2] = {};
+    int posCur = 0;
+    int attrCur = 0;
+
+    // Spatial hash
+    uint32_t *keys[2] = {};
+    uint32_t *idx[2] = {};
+    void     *sortTemp = nullptr;
+    size_t    sortTempBytes = 0;
+    uint32_t *cellStart = nullptr;
+    uint32_t *cellEnd = nullptr;
+    int       cellCapacity = 0;
+    int       numCells = 0;
+    int       keyBits = 1;
+    Grid      grid = {1.0f, 1, 1};
+
+    // Output
+    float4               *dInstances = nullptr;
+    CircleInstance       *hInstances = nullptr;   // pinned, for fast async D2H copies
+    cudaGraphicsResource *vboResource = nullptr;
+
+    // Statistics, double buffered so the host never waits on the GPU to read them
+    SimStats    *dStats = nullptr;
+    SimStats    *hStats[2] = {};                   // pinned
+    cudaEvent_t  evStart[2] = {};
+    cudaEvent_t  evStop[2] = {};
+    cudaEvent_t  evDone[2] = {};
+    bool         pending[2] = {};
+    unsigned     frame = 0;
+
+    // One cached graph per starting buffer parity
+    GraphEntry graphs[4];
+    bool       graphsDisabled = false;
+};
+
+GpuState g;
+
+// ---------------------------------------------------------------------------
+// Device helpers
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ int cell_coord(float v, float invCellSize, int n)
+{
+    int c = static_cast<int>(v * invCellSize);
+    return min(max(c, 0), n - 1);
+}
+
+__device__ __forceinline__ float warp_reduce_sum(float v)
+{
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xFFFFFFFFu, v, offset);
+    return v;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float v)
+{
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
+        v = fmaxf(v, __shfl_down_sync(0xFFFFFFFFu, v, offset));
+    return v;
+}
+
+__device__ __forceinline__ unsigned warp_reduce_sum(unsigned v)
+{
+    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xFFFFFFFFu, v, offset);
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// Kernels
+// ---------------------------------------------------------------------------
+
+__global__ void __launch_bounds__(kBlockSize)
+k_integrate_hash(float2 *__restrict__ pos, float2 *__restrict__ vel,
+                 const float *__restrict__ radius,
+                 uint32_t *__restrict__ keys, uint32_t *__restrict__ idx,
+                 int n, SimParams params, float h, float dampingStep, Grid grid)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        float2 p = pos[i];
+        float2 v = vel[i];
+        integrate_body(&p.x, &p.y, &v.x, &v.y, radius[i], params.gravity, dampingStep, h,
+                       params.width, params.height, params.elasticity);
+        pos[i] = p;
+        vel[i] = v;
+
+        int cx = cell_coord(p.x, grid.invCellSize, grid.width);
+        int cy = cell_coord(p.y, grid.invCellSize, grid.height);
+        keys[i] = static_cast<uint32_t>(cy * grid.width + cx);
+        idx[i] = static_cast<uint32_t>(i);
     }
 }
 
-// -----------------------------
-// Host API implementations
-// -----------------------------
-void physics_gpu_init(Circle **out_d_circles, int maxCount) {
-    if (g_maxCount >= maxCount && d_persistent != nullptr && d_temp != nullptr) {
-        // already allocated enough
-        *out_d_circles = d_temp;
-        return;
+// Finds each cell's [start, end) range in the sorted keys and gathers all
+// attributes into sorted order. Each thread compares its key with the previous
+// thread's key; the block stages keys in shared memory so every key is read from
+// global memory once instead of twice.
+__global__ void __launch_bounds__(kBlockSize)
+k_reorder(const uint32_t *__restrict__ sortedKeys, const uint32_t *__restrict__ sortedIdx, int n,
+          uint32_t *__restrict__ cellStart, uint32_t *__restrict__ cellEnd,
+          const float2 *__restrict__ posIn, const float2 *__restrict__ velIn,
+          const float *__restrict__ radiusIn, const float *__restrict__ invMassIn,
+          const uint32_t *__restrict__ colorIn,
+          float2 *__restrict__ posOut, float2 *__restrict__ velOut,
+          float *__restrict__ radiusOut, float *__restrict__ invMassOut,
+          uint32_t *__restrict__ colorOut)
+{
+    __shared__ uint32_t sKeys[kBlockSize + 1];
+
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t key = 0;
+    if (i < n) {
+        key = sortedKeys[i];
+        sKeys[threadIdx.x + 1] = key;
+        if (threadIdx.x == 0 && i > 0) sKeys[0] = sortedKeys[i - 1];
     }
+    __syncthreads();
 
-    // free old if exists
-    if (d_persistent) { CUDA_CHECK(cudaFree(d_persistent)); d_persistent = nullptr; }
-    if (d_temp) { CUDA_CHECK(cudaFree(d_temp)); d_temp = nullptr; }
+    if (i >= n) return;
 
-    g_maxCount = maxCount;
-    size_t bytes = sizeof(Circle) * (size_t)maxCount;
-    CUDA_CHECK(cudaMalloc((void**)&d_persistent, bytes));
-    CUDA_CHECK(cudaMalloc((void**)&d_temp, bytes));
+    if (i == 0 || key != sKeys[threadIdx.x]) {
+        cellStart[key] = static_cast<uint32_t>(i);
+        if (i > 0) cellEnd[sKeys[threadIdx.x]] = static_cast<uint32_t>(i);
+    }
+    if (i == n - 1) cellEnd[key] = static_cast<uint32_t>(n);
 
-    // zero init
-    CUDA_CHECK(cudaMemset(d_persistent, 0, bytes));
-    CUDA_CHECK(cudaMemset(d_temp, 0, bytes));
-
-    *out_d_circles = d_temp;
+    // Gather: scattered reads once per sub-step, coalesced writes, and from then
+    // on every solver iteration reads neighbours from nearby addresses.
+    const uint32_t src = sortedIdx[i];
+    posOut[i] = posIn[src];
+    velOut[i] = velIn[src];
+    radiusOut[i] = radiusIn[src];
+    invMassOut[i] = invMassIn[src];
+    colorOut[i] = colorIn[src];
 }
 
-void physics_gpu_cleanup(Circle *d_circles) {
-    (void)d_circles; // pointer passed from main; we manage our own buffers
-    if (cuda_vbo_resource) {
-        cudaGraphicsUnregisterResource(cuda_vbo_resource);
-        cuda_vbo_resource = nullptr;
-    }
-    if (d_persistent) { CUDA_CHECK(cudaFree(d_persistent)); d_persistent = nullptr; }
-    if (d_temp) { CUDA_CHECK(cudaFree(d_temp)); d_temp = nullptr; }
-    g_maxCount = 0;
-}
+// One Jacobi iteration, one thread per circle. kSleep is set on the last
+// iteration of a sub-step and kStats on the last iteration of the frame.
+template <bool kSleep, bool kStats>
+__global__ void __launch_bounds__(kBlockSize)
+k_solve(const float2 *__restrict__ posIn, const float2 *__restrict__ velIn,
+        const float *__restrict__ radius, const float *__restrict__ invMass,
+        const uint32_t *__restrict__ cellStart, const uint32_t *__restrict__ cellEnd,
+        float2 *__restrict__ posOut, float2 *__restrict__ velOut,
+        int n, SimParams params, float invH, Grid grid, SimStats *__restrict__ stats)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
 
-void physics_gpu_register_vbo(unsigned int vbo, int maxCount) {
-    // Register VBO with CUDA (if already registered, unregister first)
-    if (cuda_vbo_resource) {
-        cudaGraphicsUnregisterResource(cuda_vbo_resource);
-        cuda_vbo_resource = nullptr;
-    }
-    if (vbo != 0) {
-        CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&cuda_vbo_resource, vbo, cudaGraphicsMapFlagsWriteDiscard));
-    }
-    // Ensure we have buffers allocated for maxCount
-    if (g_maxCount < maxCount) {
-        Circle *tmp = nullptr;
-        physics_gpu_init(&tmp, maxCount);
-    }
-}
+    float maxPen = 0.0f;
+    float kinetic = 0.0f;
+    unsigned contacts = 0;
 
-void physics_gpu_unregister_vbo() {
-    if (cuda_vbo_resource) {
-        CUDA_CHECK(cudaGraphicsUnregisterResource(cuda_vbo_resource));
-        cuda_vbo_resource = nullptr;
-    }
-}
+    if (i < n) {
+        float2 p = posIn[i];
+        float2 v = velIn[i];
+        const float r = radius[i];
+        const float w = invMass[i];
 
-void physics_gpu_sync_persistent(const Circle *host_circles, int count) {
-    if (!d_persistent) return;
-    size_t bytes = sizeof(Circle) * (size_t)count;
-    CUDA_CHECK(cudaMemcpy(d_persistent, host_circles, bytes, cudaMemcpyHostToDevice));
-    // Also mirror into the temp buffer (for copy-mode)
-    if (d_temp) CUDA_CHECK(cudaMemcpy(d_temp, host_circles, bytes, cudaMemcpyHostToDevice));
-}
+        ContactAccum acc;
+        contact_accum_reset(&acc);
 
-// physics_gpu_update: GPU copy mode. Copies host->device (d_temp), runs physics on device, copies back to host_circles
-void physics_gpu_update(Circle *host_circles, Circle *d_circles, int count, const SimParams *params, float dt) {
-    if (count <= 0) return;
-    if (!d_temp) {
-        Circle *tmp = nullptr;
-        physics_gpu_init(&tmp, count);
-    }
-
-    size_t bytes = sizeof(Circle) * (size_t)count;
-    // Copy host to device temp
-    CUDA_CHECK(cudaMemcpy(d_temp, host_circles, bytes, cudaMemcpyHostToDevice));
-
-    // Prepare kernels
-    int blockSize = 256;
-    int gridSize = (count + blockSize - 1) / blockSize;
-    float damping_base = powf(params->damping, dt * 60.0f);
-
-    // integrate
-    kernel_integrate<<<gridSize, blockSize>>>(d_temp, count, params->gravity, damping_base, dt, params->width, params->height);
-    CUDA_CHECK(cudaGetLastError());
-
-    // iterative collision solver
-    int iterations = 10;
-    if (count > 500) iterations = 15;
-    if (count > 2000) iterations = 20;
-
-    // Precompute total pair count and thread grid for pair kernel
-    unsigned long long total_pairs = (unsigned long long)count * (unsigned long long)(count - 1) / 2ULL;
-    if (total_pairs > 0) {
-        // choose block/grid for pairs
-        // limit threads launched to reasonable number (cap grid).
-        unsigned long long maxThreads = 1024ULL * 1024ULL * 4ULL; // cap approx
-        unsigned long long launchThreads = total_pairs;
-        if (launchThreads > maxThreads) launchThreads = maxThreads;
-        int pairBlock = 256;
-        unsigned long long pairGrid = (launchThreads + pairBlock - 1ULL) / pairBlock;
-        if (pairGrid > 65535ULL) pairGrid = 65535ULL; // CUDA grid limit for many devices
-
-        for (int iter = 0; iter < iterations; ++iter) {
-            // Each invocation processes up to pairGrid*pairBlock pairs. If total_pairs > launchThreads,
-            // we run multiple passes offsetting k by processed.
-            unsigned long long remaining = total_pairs;
-            unsigned long long base_k = 0;
-            while (remaining > 0) {
-                unsigned long long thisBatch = pairGrid * pairBlock;
-                if (thisBatch > remaining) thisBatch = remaining;
-                int thisGrid = (int)((thisBatch + pairBlock - 1ULL) / pairBlock);
-                // Launch kernel with implicit assumption threads map global k starting at base_k.
-                // To pass base_k, we can shift indices by adding base_k; but kernel currently assumes k starts at 0.
-                // We'll relaunch kernel multiple times where each pass only resolves first thisBatch pairs:
-                kernel_pairwise_resolve<<<thisGrid, pairBlock>>>(d_temp, count, params->elasticity, dt);
-                CUDA_CHECK(cudaGetLastError());
-                // Note: kernel currently always starts from k=0 -> may reprocess same pairs repeatedly; acceptable for robustness.
-                // A more exact mapping would pass base_k to the kernel. For simplicity and stability we leave as-is.
-                remaining -= thisBatch;
-                base_k += thisBatch;
+        const int cx = cell_coord(p.x, grid.invCellSize, grid.width);
+        const int cy = cell_coord(p.y, grid.invCellSize, grid.height);
+        for (int ny = max(cy - 1, 0); ny <= min(cy + 1, grid.height - 1); ny++) {
+            for (int nx = max(cx - 1, 0); nx <= min(cx + 1, grid.width - 1); nx++) {
+                const int cell = ny * grid.width + nx;
+                const uint32_t start = cellStart[cell];
+                if (start == kEmptyCell) continue;
+                const uint32_t end = cellEnd[cell];
+                for (uint32_t j = start; j < end; j++) {
+                    if (j == static_cast<uint32_t>(i)) continue;
+                    const float2 q = posIn[j];
+                    const float2 u = velIn[j];
+                    contact_accumulate(&acc, i, p.x, p.y, v.x, v.y, r, w,
+                                       static_cast<int>(j), q.x, q.y, u.x, u.y, radius[j], invMass[j],
+                                       params.elasticity, invH);
+                }
             }
+        }
+
+        contact_apply(&acc, &p.x, &p.y, &v.x, &v.y);
+        apply_walls(&p.x, &p.y, &v.x, &v.y, r, params.width, params.height, params.elasticity);
+        if (kSleep) sleep_body(&v.x, &v.y);
+
+        posOut[i] = p;
+        velOut[i] = v;
+
+        if (kStats) {
+            maxPen = acc.maxPenetration;
+            contacts = static_cast<unsigned>(acc.contacts);
+            if (w > 0.0f) kinetic = 0.5f * (v.x * v.x + v.y * v.y) / w;
         }
     }
 
-    // Copy back to host
-    CUDA_CHECK(cudaMemcpy(host_circles, d_temp, bytes, cudaMemcpyDeviceToHost));
-}
+    if (kStats) {
+        // Warp shuffles, then one shared-memory slot per warp, then one atomic
+        // per block instead of one per thread.
+        __shared__ float    sMax[kWarpsPerBlock];
+        __shared__ float    sKinetic[kWarpsPerBlock];
+        __shared__ unsigned sContacts[kWarpsPerBlock];
 
-// physics_gpu_update_vbo: For interop mode - run physics on d_persistent and write results directly to mapped VBO
-void physics_gpu_update_vbo(unsigned int vbo, int count, const SimParams *params, float dt) {
-    if (count <= 0) return;
-    if (!d_persistent) {
-        // nothing to do
-        return;
-    }
+        const int lane = threadIdx.x % kWarpSize;
+        const int warp = threadIdx.x / kWarpSize;
 
-    // Run physics on d_persistent
-    int blockSize = 256;
-    int gridSize = (count + blockSize - 1) / blockSize;
-    float damping_base = powf(params->damping, dt * 60.0f);
+        maxPen = warp_reduce_max(maxPen);
+        kinetic = warp_reduce_sum(kinetic);
+        contacts = warp_reduce_sum(contacts);
+        if (lane == 0) {
+            sMax[warp] = maxPen;
+            sKinetic[warp] = kinetic;
+            sContacts[warp] = contacts;
+        }
+        __syncthreads();
 
-    kernel_integrate<<<gridSize, blockSize>>>(d_persistent, count, params->gravity, damping_base, dt, params->width, params->height);
-    CUDA_CHECK(cudaGetLastError());
-
-    int iterations = 10;
-    if (count > 500) iterations = 15;
-    if (count > 2000) iterations = 20;
-
-    unsigned long long total_pairs = (unsigned long long)count * (unsigned long long)(count - 1) / 2ULL;
-    if (total_pairs > 0) {
-        unsigned long long maxThreads = 1024ULL * 1024ULL * 4ULL;
-        unsigned long long launchThreads = total_pairs;
-        if (launchThreads > maxThreads) launchThreads = maxThreads;
-        int pairBlock = 256;
-        unsigned long long pairGrid = (launchThreads + pairBlock - 1ULL) / pairBlock;
-        if (pairGrid > 65535ULL) pairGrid = 65535ULL;
-
-        for (int iter = 0; iter < iterations; ++iter) {
-            unsigned long long remaining = total_pairs;
-            while (remaining > 0) {
-                unsigned long long thisBatch = pairGrid * pairBlock;
-                if (thisBatch > remaining) thisBatch = remaining;
-                int thisGrid = (int)((thisBatch + pairBlock - 1ULL) / pairBlock);
-                kernel_pairwise_resolve<<<thisGrid, pairBlock>>>(d_persistent, count, params->elasticity, dt);
-                CUDA_CHECK(cudaGetLastError());
-                remaining -= thisBatch;
+        if (warp == 0) {
+            maxPen = lane < kWarpsPerBlock ? sMax[lane] : 0.0f;
+            kinetic = lane < kWarpsPerBlock ? sKinetic[lane] : 0.0f;
+            contacts = lane < kWarpsPerBlock ? sContacts[lane] : 0u;
+            maxPen = warp_reduce_max(maxPen);
+            kinetic = warp_reduce_sum(kinetic);
+            contacts = warp_reduce_sum(contacts);
+            if (lane == 0) {
+                // Non-negative floats order the same as their bit patterns as ints
+                atomicMax(reinterpret_cast<int *>(&stats->maxPenetration), __float_as_int(maxPen));
+                atomicAdd(&stats->kineticEnergy, kinetic);
+                atomicAdd(&stats->contacts, contacts);
             }
         }
     }
+}
 
-    // Map VBO and write results
-    if (cuda_vbo_resource) {
-        void *devPtr = nullptr;
-        size_t size = 0;
-        CUDA_CHECK(cudaGraphicsMapResources(1, &cuda_vbo_resource, 0));
-        CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(&devPtr, &size, cuda_vbo_resource));
-        // We assume VBO has at least count entries sized like VBOVertex
-        VBOVertex *vbo_dev = (VBOVertex*)devPtr;
-        int writeBlock = 256;
-        int writeGrid = (count + writeBlock - 1) / writeBlock;
-        kernel_write_vbo<<<writeGrid, writeBlock>>>(d_persistent, count, vbo_dev);
+// Packs render data as one 16-byte float4 per circle: a single vectorised,
+// coalesced store per thread, matching the VBO layout (x, y, radius, rgba8).
+__global__ void __launch_bounds__(kBlockSize)
+k_write_instances(const float2 *__restrict__ pos, const float *__restrict__ radius,
+                  const uint32_t *__restrict__ color, float4 *__restrict__ out, int n)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
+        const float2 p = pos[i];
+        out[i] = make_float4(p.x, p.y, radius[i], __uint_as_float(color[i]));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host side
+// ---------------------------------------------------------------------------
+
+int blocks_for(int n)
+{
+    return (n + kBlockSize - 1) / kBlockSize;
+}
+
+void destroy_graphs()
+{
+    for (GraphEntry &e : g.graphs) {
+        if (e.exec) cudaGraphExecDestroy(e.exec);
+        e = GraphEntry();
+    }
+}
+
+// Enqueues one full frame (all sub-steps) on the stream, starting from the given
+// buffer indices. Returns the indices the data ends up in.
+void enqueue_frame(const SimParams &params, float dt, int posCur, int attrCur,
+                   int *endPosCur, int *endAttrCur)
+{
+    const int n = g.count;
+    const int blocks = blocks_for(n);
+    const int substeps = params.substeps > 0 ? params.substeps : 1;
+    const int iterations = params.iterations > 0 ? params.iterations : 1;
+    const float h = dt / static_cast<float>(substeps);
+    const float invH = 1.0f / h;
+    const float dampingStep = powf(params.damping, h * 60.0f);
+
+    cudaMemsetAsync(g.dStats, 0, sizeof(SimStats), g.stream);
+
+    for (int sub = 0; sub < substeps; sub++) {
+        k_integrate_hash<<<blocks, kBlockSize, 0, g.stream>>>(
+            g.pos[posCur], g.vel[posCur], g.radius[attrCur], g.keys[0], g.idx[0],
+            n, params, h, dampingStep, g.grid);
+
+        cub::DoubleBuffer<uint32_t> keys(g.keys[0], g.keys[1]);
+        cub::DoubleBuffer<uint32_t> values(g.idx[0], g.idx[1]);
+        cub::DeviceRadixSort::SortPairs(g.sortTemp, g.sortTempBytes, keys, values, n,
+                                        0, g.keyBits, g.stream);
+
+        cudaMemsetAsync(g.cellStart, 0xFF, sizeof(uint32_t) * static_cast<size_t>(g.numCells), g.stream);
+
+        const int posDst = 1 - posCur;
+        const int attrDst = 1 - attrCur;
+        k_reorder<<<blocks, kBlockSize, 0, g.stream>>>(
+            keys.Current(), values.Current(), n, g.cellStart, g.cellEnd,
+            g.pos[posCur], g.vel[posCur], g.radius[attrCur], g.invMass[attrCur], g.color[attrCur],
+            g.pos[posDst], g.vel[posDst], g.radius[attrDst], g.invMass[attrDst], g.color[attrDst]);
+        posCur = posDst;
+        attrCur = attrDst;
+
+        for (int iter = 0; iter < iterations; iter++) {
+            const bool lastIter = iter == iterations - 1;
+            const bool lastOfFrame = lastIter && sub == substeps - 1;
+            const int out = 1 - posCur;
+            if (lastOfFrame) {
+                k_solve<true, true><<<blocks, kBlockSize, 0, g.stream>>>(
+                    g.pos[posCur], g.vel[posCur], g.radius[attrCur], g.invMass[attrCur],
+                    g.cellStart, g.cellEnd, g.pos[out], g.vel[out], n, params, invH, g.grid, g.dStats);
+            } else if (lastIter) {
+                k_solve<true, false><<<blocks, kBlockSize, 0, g.stream>>>(
+                    g.pos[posCur], g.vel[posCur], g.radius[attrCur], g.invMass[attrCur],
+                    g.cellStart, g.cellEnd, g.pos[out], g.vel[out], n, params, invH, g.grid, nullptr);
+            } else {
+                k_solve<false, false><<<blocks, kBlockSize, 0, g.stream>>>(
+                    g.pos[posCur], g.vel[posCur], g.radius[attrCur], g.invMass[attrCur],
+                    g.cellStart, g.cellEnd, g.pos[out], g.vel[out], n, params, invH, g.grid, nullptr);
+            }
+            posCur = out;
+        }
+    }
+
+    *endPosCur = posCur;
+    *endAttrCur = attrCur;
+}
+
+// Captures the frame into a CUDA graph the first time a configuration is seen
+// (or after a parameter change), then replays it. Falls back to direct launches
+// if capture is not supported.
+void run_frame(const SimParams &params, float dt)
+{
+    FrameConfig config;
+    std::memset(&config, 0, sizeof(config));
+    config.params = params;
+    config.dt = dt;
+    config.count = g.count;
+    config.posCur = g.posCur;
+    config.attrCur = g.attrCur;
+
+    GraphEntry &entry = g.graphs[g.posCur * 2 + g.attrCur];
+
+    if (!g.graphsDisabled && (!entry.exec || std::memcmp(&entry.config, &config, sizeof(config)) != 0)) {
+        cudaGraph_t graph = nullptr;
+        int endPos = 0, endAttr = 0;
+        bool captured = CUDA_CHECK(cudaStreamBeginCapture(g.stream, cudaStreamCaptureModeThreadLocal));
+        if (captured) {
+            enqueue_frame(params, dt, g.posCur, g.attrCur, &endPos, &endAttr);
+            captured = CUDA_CHECK(cudaStreamEndCapture(g.stream, &graph)) && graph != nullptr;
+        }
+
+        bool ready = false;
+        if (captured && entry.exec) {
+            cudaGraphExecUpdateResultInfo info;
+            ready = cudaGraphExecUpdate(entry.exec, graph, &info) == cudaSuccess;
+            if (!ready) {
+                cudaGetLastError();
+                cudaGraphExecDestroy(entry.exec);
+                entry.exec = nullptr;
+            }
+        }
+        if (captured && !ready) {
+            ready = CUDA_CHECK(cudaGraphInstantiate(&entry.exec, graph, 0));
+        }
+        if (graph) cudaGraphDestroy(graph);
+
+        if (ready) {
+            entry.config = config;
+            entry.endPosCur = endPos;
+            entry.endAttrCur = endAttr;
+        } else {
+            std::fprintf(stderr, "CUDA graph capture unavailable, using direct launches\n");
+            cudaGetLastError();
+            destroy_graphs();
+            g.graphsDisabled = true;
+        }
+    }
+
+    if (!g.graphsDisabled && entry.exec) {
+        CUDA_CHECK(cudaGraphLaunch(entry.exec, g.stream));
+        g.posCur = entry.endPosCur;
+        g.attrCur = entry.endAttrCur;
+    } else {
+        enqueue_frame(params, dt, g.posCur, g.attrCur, &g.posCur, &g.attrCur);
         CUDA_CHECK(cudaGetLastError());
-        CUDA_CHECK(cudaGraphicsUnmapResources(1, &cuda_vbo_resource, 0));
     }
+}
+
+void write_instances(float4 *out)
+{
+    k_write_instances<<<blocks_for(g.count), kBlockSize, 0, g.stream>>>(
+        g.pos[g.posCur], g.radius[g.attrCur], g.color[g.attrCur], out, g.count);
+}
+
+bool ensure_cell_capacity(int numCells)
+{
+    if (numCells <= g.cellCapacity) return true;
+    cudaFree(g.cellStart);
+    cudaFree(g.cellEnd);
+    g.cellStart = g.cellEnd = nullptr;
+    g.cellCapacity = 0;
+    if (!CUDA_CHECK(cudaMalloc(&g.cellStart, sizeof(uint32_t) * static_cast<size_t>(numCells))) ||
+        !CUDA_CHECK(cudaMalloc(&g.cellEnd, sizeof(uint32_t) * static_cast<size_t>(numCells)))) {
+        return false;
+    }
+    g.cellCapacity = numCells;
+    return true;
+}
+
+} // namespace
+
+bool physics_gpu_init(int capacity, bool preferGLDevice)
+{
+    if (g.initialized) return true;
+
+    int deviceCount = 0;
+    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0) {
+        cudaGetLastError();
+        std::fprintf(stderr, "No CUDA device available; GPU modes disabled\n");
+        return false;
+    }
+
+    // On multi-GPU systems interop only works with the device driving the GL context.
+    int device = 0;
+    if (preferGLDevice) {
+        unsigned int glDeviceCount = 0;
+        int glDevices[4];
+        if (cudaGLGetDevices(&glDeviceCount, glDevices, 4, cudaGLDeviceListAll) == cudaSuccess &&
+            glDeviceCount > 0) {
+            device = glDevices[0];
+        } else {
+            cudaGetLastError();
+        }
+    }
+    if (!CUDA_CHECK(cudaSetDevice(device))) return false;
+
+    cudaDeviceProp props;
+    if (CUDA_CHECK(cudaGetDeviceProperties(&props, device))) {
+        std::snprintf(g.deviceName, sizeof(g.deviceName), "%s (sm_%d%d)", props.name, props.major, props.minor);
+    }
+
+    g.capacity = capacity;
+    const size_t n = static_cast<size_t>(capacity);
+    bool ok = CUDA_CHECK(cudaStreamCreateWithFlags(&g.stream, cudaStreamNonBlocking));
+    for (int b = 0; b < 2 && ok; b++) {
+        ok = CUDA_CHECK(cudaMalloc(&g.pos[b], sizeof(float2) * n)) &&
+             CUDA_CHECK(cudaMalloc(&g.vel[b], sizeof(float2) * n)) &&
+             CUDA_CHECK(cudaMalloc(&g.radius[b], sizeof(float) * n)) &&
+             CUDA_CHECK(cudaMalloc(&g.invMass[b], sizeof(float) * n)) &&
+             CUDA_CHECK(cudaMalloc(&g.color[b], sizeof(uint32_t) * n)) &&
+             CUDA_CHECK(cudaMalloc(&g.keys[b], sizeof(uint32_t) * n)) &&
+             CUDA_CHECK(cudaMalloc(&g.idx[b], sizeof(uint32_t) * n)) &&
+             CUDA_CHECK(cudaEventCreate(&g.evStart[b])) &&
+             CUDA_CHECK(cudaEventCreate(&g.evStop[b])) &&
+             CUDA_CHECK(cudaEventCreateWithFlags(&g.evDone[b], cudaEventDisableTiming)) &&
+             CUDA_CHECK(cudaMallocHost(&g.hStats[b], sizeof(SimStats)));
+    }
+    if (ok) {
+        // Size the sort's scratch space once for the worst case, so nothing is
+        // allocated per frame (which would also break graph capture).
+        cub::DoubleBuffer<uint32_t> keys(g.keys[0], g.keys[1]);
+        cub::DoubleBuffer<uint32_t> values(g.idx[0], g.idx[1]);
+        ok = CUDA_CHECK(cub::DeviceRadixSort::SortPairs(nullptr, g.sortTempBytes, keys, values,
+                                                        capacity, 0, 32)) &&
+             CUDA_CHECK(cudaMalloc(&g.sortTemp, g.sortTempBytes)) &&
+             CUDA_CHECK(cudaMalloc(&g.dInstances, sizeof(float4) * n)) &&
+             CUDA_CHECK(cudaMallocHost(&g.hInstances, sizeof(CircleInstance) * n)) &&
+             CUDA_CHECK(cudaMalloc(&g.dStats, sizeof(SimStats)));
+    }
+
+    g.initialized = true;   // lets shutdown free a partial allocation
+    if (!ok) {
+        physics_gpu_shutdown();
+        return false;
+    }
+    return true;
+}
+
+void physics_gpu_shutdown()
+{
+    if (!g.initialized) return;
+    if (g.stream) cudaStreamSynchronize(g.stream);
+    destroy_graphs();
+    if (g.vboResource) cudaGraphicsUnregisterResource(g.vboResource);
+    for (int b = 0; b < 2; b++) {
+        cudaFree(g.pos[b]);
+        cudaFree(g.vel[b]);
+        cudaFree(g.radius[b]);
+        cudaFree(g.invMass[b]);
+        cudaFree(g.color[b]);
+        cudaFree(g.keys[b]);
+        cudaFree(g.idx[b]);
+        if (g.evStart[b]) cudaEventDestroy(g.evStart[b]);
+        if (g.evStop[b]) cudaEventDestroy(g.evStop[b]);
+        if (g.evDone[b]) cudaEventDestroy(g.evDone[b]);
+        cudaFreeHost(g.hStats[b]);
+    }
+    cudaFree(g.sortTemp);
+    cudaFree(g.cellStart);
+    cudaFree(g.cellEnd);
+    cudaFree(g.dInstances);
+    cudaFreeHost(g.hInstances);
+    cudaFree(g.dStats);
+    if (g.stream) cudaStreamDestroy(g.stream);
+    g = GpuState();
+}
+
+const char *physics_gpu_device_name()
+{
+    return g.deviceName;
+}
+
+bool physics_gpu_register_vbo(unsigned int vbo)
+{
+    if (!g.initialized || vbo == 0) return false;
+    if (g.vboResource) {
+        cudaGraphicsUnregisterResource(g.vboResource);
+        g.vboResource = nullptr;
+    }
+    if (cudaGraphicsGLRegisterBuffer(&g.vboResource, vbo, cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess) {
+        cudaGetLastError();
+        g.vboResource = nullptr;
+        std::fprintf(stderr, "CUDA-OpenGL interop unavailable; GPU (Interop) mode disabled\n");
+        return false;
+    }
+
+    // Registration can succeed on setups where mapping still fails, so try it once.
+    bool mapped = cudaGraphicsMapResources(1, &g.vboResource, g.stream) == cudaSuccess;
+    if (mapped) mapped = cudaGraphicsUnmapResources(1, &g.vboResource, g.stream) == cudaSuccess;
+    if (!mapped) {
+        cudaGetLastError();
+        cudaGraphicsUnregisterResource(g.vboResource);
+        g.vboResource = nullptr;
+        std::fprintf(stderr, "CUDA-OpenGL interop mapping failed; GPU (Interop) mode disabled\n");
+        return false;
+    }
+    return true;
+}
+
+void physics_gpu_upload(const CircleArrays *c, int count, float maxRadius, float width, float height)
+{
+    if (!g.initialized) return;
+    cudaStreamSynchronize(g.stream);
+    destroy_graphs();
+
+    g.count = count < g.capacity ? count : g.capacity;
+    g.posCur = 0;
+    g.attrCur = 0;
+
+    const float cellSize = fmaxf(2.0f * maxRadius, 1.0f);
+    g.grid.invCellSize = 1.0f / cellSize;
+    g.grid.width = static_cast<int>(ceilf(width / cellSize));
+    g.grid.height = static_cast<int>(ceilf(height / cellSize));
+    if (g.grid.width < 1) g.grid.width = 1;
+    if (g.grid.height < 1) g.grid.height = 1;
+    g.numCells = g.grid.width * g.grid.height;
+
+    // Sort only as many key bits as the largest cell id needs: fewer radix passes.
+    g.keyBits = 1;
+    while ((1u << g.keyBits) < static_cast<unsigned>(g.numCells)) g.keyBits++;
+
+    if (!ensure_cell_capacity(g.numCells)) {
+        g.count = 0;
+        return;
+    }
+
+    const size_t n = static_cast<size_t>(g.count);
+    CUDA_CHECK(cudaMemcpy(g.pos[0], c->pos, sizeof(float2) * n, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g.vel[0], c->vel, sizeof(float2) * n, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g.radius[0], c->radius, sizeof(float) * n, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g.invMass[0], c->invMass, sizeof(float) * n, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(g.color[0], c->color, sizeof(uint32_t) * n, cudaMemcpyHostToDevice));
+}
+
+void physics_gpu_download(CircleArrays *c, int count)
+{
+    if (!g.initialized) return;
+    cudaStreamSynchronize(g.stream);
+    const size_t n = static_cast<size_t>(count < g.count ? count : g.count);
+    CUDA_CHECK(cudaMemcpy(c->pos, g.pos[g.posCur], sizeof(float2) * n, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(c->vel, g.vel[g.posCur], sizeof(float2) * n, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(c->radius, g.radius[g.attrCur], sizeof(float) * n, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(c->invMass, g.invMass[g.attrCur], sizeof(float) * n, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(c->color, g.color[g.attrCur], sizeof(uint32_t) * n, cudaMemcpyDeviceToHost));
+}
+
+void physics_gpu_step(const SimParams *params, float dt, GpuOutput output)
+{
+    if (!g.initialized || g.count <= 0 || dt <= 0.0f) return;
+    if (output == GPU_OUTPUT_VBO && !g.vboResource) output = GPU_OUTPUT_HOST;
+
+    const int slot = static_cast<int>(g.frame & 1u);
+    cudaEventRecord(g.evStart[slot], g.stream);
+
+    run_frame(*params, dt);
+
+    if (output == GPU_OUTPUT_VBO) {
+        void *mapped = nullptr;
+        size_t bytes = 0;
+        if (CUDA_CHECK(cudaGraphicsMapResources(1, &g.vboResource, g.stream))) {
+            if (CUDA_CHECK(cudaGraphicsResourceGetMappedPointer(&mapped, &bytes, g.vboResource)) &&
+                bytes >= sizeof(float4) * static_cast<size_t>(g.count)) {
+                write_instances(static_cast<float4 *>(mapped));
+            }
+            CUDA_CHECK(cudaGraphicsUnmapResources(1, &g.vboResource, g.stream));
+        }
+    } else if (output == GPU_OUTPUT_HOST) {
+        write_instances(g.dInstances);
+        CUDA_CHECK(cudaMemcpyAsync(g.hInstances, g.dInstances, sizeof(float4) * static_cast<size_t>(g.count),
+                                   cudaMemcpyDeviceToHost, g.stream));
+    }
+
+    cudaEventRecord(g.evStop[slot], g.stream);
+    cudaMemcpyAsync(g.hStats[slot], g.dStats, sizeof(SimStats), cudaMemcpyDeviceToHost, g.stream);
+    cudaEventRecord(g.evDone[slot], g.stream);
+    g.pending[slot] = true;
+    g.frame++;
+
+    if (output == GPU_OUTPUT_HOST) {
+        CUDA_CHECK(cudaStreamSynchronize(g.stream));
+    }
+}
+
+const CircleInstance *physics_gpu_host_instances()
+{
+    return g.hInstances;
+}
+
+bool physics_gpu_poll_stats(GpuFrameStats *out)
+{
+    if (!g.initialized) return false;
+    bool found = false;
+    // Oldest first, so the newest finished frame wins.
+    for (unsigned back = 2; back >= 1; back--) {
+        if (g.frame < back) continue;
+        const int slot = static_cast<int>((g.frame - back) & 1u);
+        if (!g.pending[slot]) continue;
+        cudaError_t status = cudaEventQuery(g.evDone[slot]);
+        if (status == cudaErrorNotReady) {
+            cudaGetLastError();
+            continue;
+        }
+        if (status != cudaSuccess) {
+            cuda_ok(status, "cudaEventQuery");
+            g.pending[slot] = false;
+            continue;
+        }
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, g.evStart[slot], g.evStop[slot]);
+        out->sim = *g.hStats[slot];
+        out->sim.contacts /= 2;   // every contact is counted by both bodies
+        out->stepMs = ms;
+        g.pending[slot] = false;
+        found = true;
+    }
+    return found;
+}
+
+void physics_gpu_synchronize()
+{
+    if (g.initialized) cudaStreamSynchronize(g.stream);
 }

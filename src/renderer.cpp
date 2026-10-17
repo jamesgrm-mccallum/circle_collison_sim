@@ -1,205 +1,200 @@
 #include "renderer.h"
+
 #include <glad/glad.h>
-#include <GLFW/glfw3.h>
-#include <fstream>
-#include <sstream>
+
+#include <cstddef>
 #include <iostream>
-#include <cmath>
 
-Renderer::Renderer(int w, int h) : width(w), height(h), 
-    shaderProgram(0), VAO(0), VBO(0), instanceVBO(0), vbo(0) {}
+namespace {
 
-Renderer::~Renderer() {
-    cleanup();
+// Shaders are embedded so the app runs from any working directory.
+const char *kVertexShader = R"(#version 330 core
+layout (location = 0) in vec2 aCorner;   // unit quad corner in [-1, 1]
+layout (location = 1) in vec3 iCircle;   // instance: x, y, radius
+layout (location = 2) in vec4 iColor;    // instance: rgba8, normalised
+
+uniform mat4 uProjection;
+
+out vec2 vLocal;      // offset from the circle centre, in world units
+out float vRadius;
+out vec4 vColor;
+
+void main() {
+    // One unit of padding leaves room for the anti-aliased edge.
+    vLocal = aCorner * (iCircle.z + 1.0);
+    vRadius = iCircle.z;
+    vColor = iColor;
+    gl_Position = uProjection * vec4(iCircle.xy + vLocal, 0.0, 1.0);
+}
+)";
+
+const char *kFragmentShader = R"(#version 330 core
+in vec2 vLocal;
+in float vRadius;
+in vec4 vColor;
+
+out vec4 FragColor;
+
+void main() {
+    float dist = length(vLocal);
+    float coverage = clamp(vRadius - dist + 0.5, 0.0, 1.0);
+    if (coverage <= 0.0) discard;
+    float shade = 0.75 + 0.25 * (1.0 - dist / max(vRadius, 1.0));
+    FragColor = vec4(vColor.rgb * shade, vColor.a * coverage);
+}
+)";
+
+GLuint compile(GLenum type, const char *source)
+{
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint ok = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetShaderInfoLog(shader, sizeof(log), nullptr, log);
+        std::cerr << "Shader compilation failed:\n" << log << std::endl;
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
 }
 
-static std::string readFile(const char *path) {
-    std::ifstream file(path);
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
-}
-
-unsigned int Renderer::compileShader(const char *vertexPath, const char *fragmentPath) {
-    std::string vertexCode = readFile(vertexPath);
-    std::string fragmentCode = readFile(fragmentPath);
-    
-    const char *vShaderCode = vertexCode.c_str();
-    const char *fShaderCode = fragmentCode.c_str();
-    
-    unsigned int vertex, fragment;
-    int success;
-    char infoLog[512];
-    
-    // Vertex shader
-    vertex = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertex, 1, &vShaderCode, NULL);
-    glCompileShader(vertex);
-    glGetShaderiv(vertex, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        glGetShaderInfoLog(vertex, 512, NULL, infoLog);
-        std::cerr << "Vertex shader compilation failed:\n" << infoLog << std::endl;
+GLuint link_program(const char *vs, const char *fs)
+{
+    GLuint vert = compile(GL_VERTEX_SHADER, vs);
+    GLuint frag = compile(GL_FRAGMENT_SHADER, fs);
+    if (!vert || !frag) {
+        glDeleteShader(vert);
+        glDeleteShader(frag);
+        return 0;
     }
-    
-    // Fragment shader
-    fragment = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragment, 1, &fShaderCode, NULL);
-    glCompileShader(fragment);
-    glGetShaderiv(fragment, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        glGetShaderInfoLog(fragment, 512, NULL, infoLog);
-        std::cerr << "Fragment shader compilation failed:\n" << infoLog << std::endl;
-    }
-    
-    // Shader program
-    unsigned int program = glCreateProgram();
-    glAttachShader(program, vertex);
-    glAttachShader(program, fragment);
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vert);
+    glAttachShader(program, frag);
     glLinkProgram(program);
-    glGetProgramiv(program, GL_LINK_STATUS, &success);
-    if (!success) {
-        glGetProgramInfoLog(program, 512, NULL, infoLog);
-        std::cerr << "Shader program linking failed:\n" << infoLog << std::endl;
+    glDeleteShader(vert);
+    glDeleteShader(frag);
+
+    GLint ok = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        std::cerr << "Shader program linking failed:\n" << log << std::endl;
+        glDeleteProgram(program);
+        return 0;
     }
-    
-    glDeleteShader(vertex);
-    glDeleteShader(fragment);
-    
     return program;
 }
 
-void Renderer::setupCircleMesh() {
-    const int segments = 32;
-    float vertices[segments * 2];
-    
-    for (int i = 0; i < segments; i++) {
-        float angle = 2.0f * 3.14159f * i / segments;
-        vertices[i * 2 + 0] = std::cos(angle);
-        vertices[i * 2 + 1] = std::sin(angle);
-    }
-    
-    glGenVertexArrays(1, &VAO);
-    glGenBuffers(1, &VBO);
-    
-    glBindVertexArray(VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-    
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+} // namespace
+
+Renderer::Renderer(float worldWidth, float worldHeight)
+    : worldWidth(worldWidth), worldHeight(worldHeight) {}
+
+Renderer::~Renderer()
+{
+    cleanup();
+}
+
+void Renderer::setupVAO(unsigned int vao, unsigned int instanceVBO)
+{
+    glBindVertexArray(vao);
+
+    glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
     glEnableVertexAttribArray(0);
-    
+
+    const GLsizei stride = sizeof(CircleInstance);
+    glBindBuffer(GL_ARRAY_BUFFER, instanceVBO);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
+                          reinterpret_cast<void *>(offsetof(CircleInstance, x)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribDivisor(1, 1);
+    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, stride,
+                          reinterpret_cast<void *>(offsetof(CircleInstance, color)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribDivisor(2, 1);
+
     glBindVertexArray(0);
 }
 
-void Renderer::setupInstanceBuffer() {
-    glGenBuffers(1, &instanceVBO);
-}
+bool Renderer::init(int instanceCapacity)
+{
+    static_assert(sizeof(CircleInstance) == 16, "CircleInstance must match the 16-byte VBO layout");
+    static_assert(offsetof(CircleInstance, radius) == offsetof(CircleInstance, x) + 2 * sizeof(float),
+                  "x, y, radius must be contiguous for the vec3 attribute");
 
-void Renderer::init() {
-    shaderProgram = compileShader("shaders/circle.vert", "shaders/circle.frag");
-    setupCircleMesh();
-    setupInstanceBuffer();
-    
-    // Create VBO for CUDA interop (needs to be large enough)
-    glGenBuffers(1, &vbo);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    // Allocate 10000 circles * 6 floats per circle
-    glBufferData(GL_ARRAY_BUFFER, 10000 * 6 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+    capacity = instanceCapacity;
+    program = link_program(kVertexShader, kFragmentShader);
+    if (!program) return false;
+
+    // Y grows downwards so gravity (positive y) pulls circles to the bottom of the window.
+    const float l = 0.0f, r = worldWidth, t = 0.0f, b = worldHeight;
+    const float projection[16] = {
+        2.0f / (r - l), 0.0f, 0.0f, 0.0f,
+        0.0f, 2.0f / (t - b), 0.0f, 0.0f,
+        0.0f, 0.0f, -1.0f, 0.0f,
+        -(r + l) / (r - l), -(t + b) / (t - b), 0.0f, 1.0f,
+    };
+    glUseProgram(program);
+    glUniformMatrix4fv(glGetUniformLocation(program, "uProjection"), 1, GL_FALSE, projection);
+    glUseProgram(0);
+
+    const float quad[8] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f };
+    glGenBuffers(1, &quadVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+
+    const GLsizeiptr bytes = static_cast<GLsizeiptr>(sizeof(CircleInstance)) * capacity;
+    glGenBuffers(1, &streamVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, streamVBO);
+    glBufferData(GL_ARRAY_BUFFER, bytes, nullptr, GL_STREAM_DRAW);
+
+    glGenBuffers(1, &interopVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, interopVBO);
+    glBufferData(GL_ARRAY_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-    
-    std::cout << "Renderer initialized. VBO ID: " << vbo << std::endl;
+
+    glGenVertexArrays(1, &streamVAO);
+    glGenVertexArrays(1, &interopVAO);
+    setupVAO(streamVAO, streamVBO);
+    setupVAO(interopVAO, interopVBO);
+    return true;
 }
 
-void Renderer::render(Circle *circles, int count) {
-    glUseProgram(shaderProgram);
-    
-    // Set projection matrix
-    float left = 0.0f, right = (float)width;
-    float bottom = (float)height, top = 0.0f;
-    float ortho[16] = {
-        2.0f/(right-left), 0, 0, 0,
-        0, 2.0f/(top-bottom), 0, 0,
-        0, 0, -1, 0,
-        -(right+left)/(right-left), -(top+bottom)/(top-bottom), 0, 1
-    };
-    
-    int projLoc = glGetUniformLocation(shaderProgram, "projection");
-    glUniformMatrix4fv(projLoc, 1, GL_FALSE, ortho);
-    
-    // Prepare instance data
-    float *instanceData = new float[count * 6]; // x, y, r, g, b, radius
-    for (int i = 0; i < count; i++) {
-        instanceData[i * 6 + 0] = circles[i].x;
-        instanceData[i * 6 + 1] = circles[i].y;
-        instanceData[i * 6 + 2] = circles[i].r;
-        instanceData[i * 6 + 3] = circles[i].g;
-        instanceData[i * 6 + 4] = circles[i].b;
-        instanceData[i * 6 + 5] = circles[i].radius;
-    }
-    
-    glBindBuffer(GL_ARRAY_BUFFER, instanceVBO);
-    glBufferData(GL_ARRAY_BUFFER, count * 6 * sizeof(float), instanceData, GL_DYNAMIC_DRAW);
-    
-    glBindVertexArray(VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, instanceVBO);
-    
-    // Instance attributes
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribDivisor(1, 1);
-    
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glVertexAttribDivisor(2, 1);
-    
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(5 * sizeof(float)));
-    glEnableVertexAttribArray(3);
-    glVertexAttribDivisor(3, 1);
-    
-    glDrawArraysInstanced(GL_TRIANGLE_FAN, 0, 32, count);
-    
-    glBindVertexArray(0);
-    delete[] instanceData;
+void Renderer::upload(const CircleInstance *instances, int count)
+{
+    if (!instances || count <= 0) return;
+    if (count > capacity) count = capacity;
+    glBindBuffer(GL_ARRAY_BUFFER, streamVBO);
+    // Orphan the old storage so the driver doesn't stall waiting for the
+    // previous frame's draw to finish reading it.
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(sizeof(CircleInstance)) * capacity, nullptr, GL_STREAM_DRAW);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(sizeof(CircleInstance)) * count, instances);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    drawFromInterop = false;
 }
 
-void Renderer::render_interop(int count) {
-    glUseProgram(shaderProgram);
-    
-    float left = 0.0f, right = (float)width;
-    float bottom = (float)height, top = 0.0f;
-    float ortho[16] = {
-        2.0f/(right-left), 0, 0, 0,
-        0, 2.0f/(top-bottom), 0, 0,
-        0, 0, -1, 0,
-        -(right+left)/(right-left), -(top+bottom)/(top-bottom), 0, 1
-    };
-    
-    int projLoc = glGetUniformLocation(shaderProgram, "projection");
-    glUniformMatrix4fv(projLoc, 1, GL_FALSE, ortho);
-    
-    glBindVertexArray(VAO);
-    glBindBuffer(GL_ARRAY_BUFFER, vbo);
-    
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0);
-    glEnableVertexAttribArray(1);
-    glVertexAttribDivisor(1, 1);
-    
-    glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(2 * sizeof(float)));
-    glEnableVertexAttribArray(2);
-    glVertexAttribDivisor(2, 1);
-    
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(5 * sizeof(float)));
-    glEnableVertexAttribArray(3);
-    glVertexAttribDivisor(3, 1);
-    
-    glDrawArraysInstanced(GL_TRIANGLE_FAN, 0, 32, count);
+void Renderer::draw(int count)
+{
+    if (!program || count <= 0) return;
+    if (count > capacity) count = capacity;
+    glUseProgram(program);
+    glBindVertexArray(drawFromInterop ? interopVAO : streamVAO);
+    glDrawArraysInstanced(GL_TRIANGLE_STRIP, 0, 4, count);
     glBindVertexArray(0);
 }
 
-void Renderer::cleanup() {
-    if (VAO) glDeleteVertexArrays(1, &VAO);
-    if (VBO) glDeleteBuffers(1, &VBO);
-    if (instanceVBO) glDeleteBuffers(1, &instanceVBO);
-    if (vbo) glDeleteBuffers(1, &vbo);
-    if (shaderProgram) glDeleteProgram(shaderProgram);
+void Renderer::cleanup()
+{
+    if (streamVAO) glDeleteVertexArrays(1, &streamVAO);
+    if (interopVAO) glDeleteVertexArrays(1, &interopVAO);
+    if (quadVBO) glDeleteBuffers(1, &quadVBO);
+    if (streamVBO) glDeleteBuffers(1, &streamVBO);
+    if (interopVBO) glDeleteBuffers(1, &interopVBO);
+    if (program) glDeleteProgram(program);
+    streamVAO = interopVAO = quadVBO = streamVBO = interopVBO = program = 0;
 }

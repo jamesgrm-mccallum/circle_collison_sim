@@ -1,213 +1,357 @@
 #include "circle.h"
-#include <stdlib.h>
+#include "contact.h"
+
 #include <math.h>
-#include <time.h>
+#include <stdlib.h>
+#include <string.h>
 
-void physics_cpu_init(Circle *circles, int count, float width, float height) {
-    srand((unsigned int)time(NULL));
-    
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#define CACHE_LINE 64
+
+/* ---------------------------------------------------------------------------
+ * Allocation
+ * ------------------------------------------------------------------------ */
+
+/* Every array starts on its own cache line, so two arrays never share a line
+   and the static OpenMP partition below only shares lines at chunk borders. */
+static void *alloc_aligned(size_t bytes)
+{
+    size_t rounded = (bytes + CACHE_LINE - 1) / CACHE_LINE * CACHE_LINE;
+    if (rounded == 0) rounded = CACHE_LINE;
+#if defined(_WIN32)
+    return _aligned_malloc(rounded, CACHE_LINE);
+#else
+    return aligned_alloc(CACHE_LINE, rounded);
+#endif
+}
+
+static void free_aligned(void *p)
+{
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
+int circles_alloc(CircleArrays *c, int capacity)
+{
+    memset(c, 0, sizeof(*c));
+    c->pos     = (float *)alloc_aligned(sizeof(float) * 2 * (size_t)capacity);
+    c->vel     = (float *)alloc_aligned(sizeof(float) * 2 * (size_t)capacity);
+    c->radius  = (float *)alloc_aligned(sizeof(float) * (size_t)capacity);
+    c->invMass = (float *)alloc_aligned(sizeof(float) * (size_t)capacity);
+    c->color   = (uint32_t *)alloc_aligned(sizeof(uint32_t) * (size_t)capacity);
+    c->capacity = capacity;
+    if (!c->pos || !c->vel || !c->radius || !c->invMass || !c->color) {
+        circles_free(c);
+        return 0;
+    }
+    return 1;
+}
+
+void circles_free(CircleArrays *c)
+{
+    free_aligned(c->pos);
+    free_aligned(c->vel);
+    free_aligned(c->radius);
+    free_aligned(c->invMass);
+    free_aligned(c->color);
+    memset(c, 0, sizeof(*c));
+}
+
+/* ---------------------------------------------------------------------------
+ * Initialisation
+ * ------------------------------------------------------------------------ */
+
+static uint32_t xorshift32(uint32_t *state)
+{
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static float rand_unit(uint32_t *state)
+{
+    return (float)(xorshift32(state) >> 8) * (1.0f / 16777216.0f);
+}
+
+float circles_init_random(CircleArrays *c, int count, float width, float height, uint32_t seed)
+{
+    const float kPi = 3.14159265f;
+    const float kFill = 0.45f;   /* target fraction of the box covered by circles */
+
+    /* Radii are uniform in [R/2, R], so E[r^2] = 7/12 R^2. Pick R so the
+       expected total circle area is kFill of the box. */
+    float maxRadius = 19.0f;
+    if (count > 0) {
+        float fit = sqrtf(kFill * width * height / ((float)count * kPi * (7.0f / 12.0f)));
+        if (fit < maxRadius) maxRadius = fit;
+    }
+    if (maxRadius < 2.0f) maxRadius = 2.0f;
+    const float minRadius = 0.5f * maxRadius;
+
+    uint32_t state = seed ? seed : 0x9E3779B9u;
     for (int i = 0; i < count; i++) {
-        circles[i].radius = 5.0f + (float)(rand() % 15);
-        circles[i].x = circles[i].radius + (float)(rand() % (int)(width - 2 * circles[i].radius));
-        circles[i].y = circles[i].radius + (float)(rand() % (int)(height - 2 * circles[i].radius));
-        circles[i].vx = -100.0f + (float)(rand() % 200);
-        circles[i].vy = -100.0f + (float)(rand() % 200);
-        circles[i].mass = circles[i].radius * circles[i].radius * 3.14159f;
-        
-        // Random color
-        circles[i].r = (float)rand() / RAND_MAX;
-        circles[i].g = (float)rand() / RAND_MAX;
-        circles[i].b = (float)rand() / RAND_MAX;
+        float r = minRadius + (maxRadius - minRadius) * rand_unit(&state);
+        c->radius[i] = r;
+        c->pos[2 * i + 0] = r + (width - 2.0f * r) * rand_unit(&state);
+        c->pos[2 * i + 1] = r + (height - 2.0f * r) * rand_unit(&state);
+        c->vel[2 * i + 0] = -100.0f + 200.0f * rand_unit(&state);
+        c->vel[2 * i + 1] = -100.0f + 200.0f * rand_unit(&state);
+        c->invMass[i] = 1.0f / (kPi * r * r);
+
+        uint32_t rgb = xorshift32(&state);
+        c->color[i] = (rgb & 0x00FFFFFFu) | 0xFF000000u;
+    }
+    return maxRadius;
+}
+
+void circles_pack_instances(const CircleArrays *c, int count, CircleInstance *out)
+{
+    for (int i = 0; i < count; i++) {
+        out[i].x = c->pos[2 * i + 0];
+        out[i].y = c->pos[2 * i + 1];
+        out[i].radius = c->radius[i];
+        out[i].color = c->color[i];
     }
 }
 
-static void resolve_collision(Circle *a, Circle *b, float elasticity, float dt) {
-    // --- Tunable constants ---
-    const float k_slop     = 0.003f;   // small tolerance for penetration (meters)
-    const float k_percent  = 0.65f;    // percent of overlap corrected per iteration (0.5–0.8 good for piles)
-    const float bias_factor = 0.25f;   // Baumgarte bias factor (0.2–0.3 typical)
-    const float v_threshold = 0.02f;   // resting velocity threshold
+/* ---------------------------------------------------------------------------
+ * Solver
+ * ------------------------------------------------------------------------ */
 
-    // --- Compute separation vector ---
-    float dx = b->x - a->x;
-    float dy = b->y - a->y;
-    float dist_sq = dx * dx + dy * dy;
-    float min_dist = a->radius + b->radius;
+struct CpuSolver {
+    int    capacity;
+    float *pos;          /* Jacobi output buffers, swapped with the CircleArrays ones */
+    float *vel;
 
-    // skip non-overlapping pairs early
-    if (dist_sq >= min_dist * min_dist) return;
+    /* Uniform grid, built with a counting sort each step */
+    int   *cellOf;       /* cell of each body */
+    int   *sortedIdx;    /* body indices grouped by cell */
+    int   *cellStart;    /* numCells + 1 prefix offsets into sortedIdx */
+    int   *cellCursor;
+    int    cellCapacity;
+    int    gridW, gridH;
+    float  invCellSize;
+};
 
-    float dist = sqrtf(dist_sq);
-    float nx, ny;
-    if (dist < 1e-8f) {
-        // perfectly overlapping; choose arbitrary direction
-        nx = 1.0f;
-        ny = 0.0f;
-        dist = 0.0f;
-    } else {
-        nx = dx / dist;
-        ny = dy / dist;
+CpuSolver *cpu_solver_create(int capacity)
+{
+    CpuSolver *s = (CpuSolver *)calloc(1, sizeof(CpuSolver));
+    if (!s) return NULL;
+    s->capacity  = capacity;
+    s->pos       = (float *)alloc_aligned(sizeof(float) * 2 * (size_t)capacity);
+    s->vel       = (float *)alloc_aligned(sizeof(float) * 2 * (size_t)capacity);
+    s->cellOf    = (int *)alloc_aligned(sizeof(int) * (size_t)capacity);
+    s->sortedIdx = (int *)alloc_aligned(sizeof(int) * (size_t)capacity);
+    if (!s->pos || !s->vel || !s->cellOf || !s->sortedIdx) {
+        cpu_solver_destroy(s);
+        return NULL;
     }
+    return s;
+}
 
-    float penetration = min_dist - dist;
+void cpu_solver_destroy(CpuSolver *s)
+{
+    if (!s) return;
+    free_aligned(s->pos);
+    free_aligned(s->vel);
+    free_aligned(s->cellOf);
+    free_aligned(s->sortedIdx);
+    free_aligned(s->cellStart);
+    free_aligned(s->cellCursor);
+    free(s);
+}
 
-    // --- Mass properties ---
-    float invMassA = (a->mass > 0.0f) ? 1.0f / a->mass : 0.0f;
-    float invMassB = (b->mass > 0.0f) ? 1.0f / b->mass : 0.0f;
-    float invMassSum = invMassA + invMassB;
-    if (invMassSum == 0.0f) return; // both static
+int cpu_solver_configure_grid(CpuSolver *s, float width, float height, float maxRadius)
+{
+    /* A cell as wide as the largest diameter guarantees every overlapping
+       pair lies in the same or an adjacent cell. */
+    float cellSize = fmaxf(2.0f * maxRadius, 1.0f);
+    s->invCellSize = 1.0f / cellSize;
+    s->gridW = (int)ceilf(width / cellSize);
+    s->gridH = (int)ceilf(height / cellSize);
+    if (s->gridW < 1) s->gridW = 1;
+    if (s->gridH < 1) s->gridH = 1;
 
-    // --- Position correction (mass-weighted Baumgarte) ---
-    float correction = 0.0f;
-    if (penetration > k_slop)
-        correction = (penetration - k_slop) * k_percent;
-
-    float corrA = correction * (invMassA / invMassSum);
-    float corrB = correction * (invMassB / invMassSum);
-
-    a->x -= corrA * nx;
-    a->y -= corrA * ny;
-    b->x += corrB * nx;
-    b->y += corrB * ny;
-
-    // --- Relative velocity along normal ---
-    float dvx = b->vx - a->vx;
-    float dvy = b->vy - a->vy;
-    float dvn = dvx * nx + dvy * ny;
-
-    // --- Only handle approaching objects ---
-    if (dvn > -v_threshold) return;
-
-    // --- Baumgarte velocity bias (helps prevent sinking) ---
-    float bias = bias_factor * fmaxf(penetration - k_slop, 0.0f) / dt;
-
-    // --- Effective elasticity ---
-    float effective_elasticity = elasticity * 0.6f;
-
-    // --- Normal impulse ---
-    float impulse = (-(1.0f + effective_elasticity) * dvn + bias) / invMassSum;
-
-    // Apply impulse
-    float jx = impulse * nx;
-    float jy = impulse * ny;
-
-    if (invMassA > 0.0f) {
-        a->vx -= invMassA * jx;
-        a->vy -= invMassA * jy;
+    int numCells = s->gridW * s->gridH;
+    if (numCells > s->cellCapacity) {
+        free_aligned(s->cellStart);
+        free_aligned(s->cellCursor);
+        s->cellStart  = (int *)alloc_aligned(sizeof(int) * (size_t)(numCells + 1));
+        s->cellCursor = (int *)alloc_aligned(sizeof(int) * (size_t)numCells);
+        s->cellCapacity = (s->cellStart && s->cellCursor) ? numCells : 0;
     }
-    if (invMassB > 0.0f) {
-        b->vx += invMassB * jx;
-        b->vy += invMassB * jy;
+    return s->cellCapacity >= numCells;
+}
+
+int cpu_max_threads(void)
+{
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
+
+static inline int cell_coord(float v, float invCellSize, int n)
+{
+    int c = (int)(v * invCellSize);
+    return c < 0 ? 0 : (c >= n ? n - 1 : c);
+}
+
+static void build_grid(CpuSolver *s, const float *pos, int count)
+{
+    const int numCells = s->gridW * s->gridH;
+    memset(s->cellStart, 0, sizeof(int) * (size_t)(numCells + 1));
+
+    for (int i = 0; i < count; i++) {
+        int cx = cell_coord(pos[2 * i + 0], s->invCellSize, s->gridW);
+        int cy = cell_coord(pos[2 * i + 1], s->invCellSize, s->gridH);
+        int cell = cy * s->gridW + cx;
+        s->cellOf[i] = cell;
+        s->cellStart[cell + 1]++;
+    }
+    for (int c = 0; c < numCells; c++) {
+        s->cellStart[c + 1] += s->cellStart[c];
+    }
+    memcpy(s->cellCursor, s->cellStart, sizeof(int) * (size_t)numCells);
+    for (int i = 0; i < count; i++) {
+        s->sortedIdx[s->cellCursor[s->cellOf[i]]++] = i;
     }
 }
 
-void physics_cpu_update(Circle *circles, int count, const SimParams *params, float dt) {
-    //---------------------------------------------------------
-    // 1. Apply forces (gravity) and integrate velocities
-    //---------------------------------------------------------
-    // Use exponential damping (frame-rate independent)
-    // If params->damping ~ 0.98 for 60 FPS, then per-step damping = damping^(dt * 60)
-    float base_damping = powf(params->damping, dt * 60.0f);
-    float gravity = params->gravity;
+/* One sub-step: integrate, rebuild the grid, then Jacobi iterations. */
+static void cpu_substep(CpuSolver *s, CircleArrays *c, int count, const SimParams *params,
+                        float h, int useGrid, int numThreads, SimStats *stats)
+{
+    (void)numThreads;  /* unused without OpenMP */
+    const float dampingStep = powf(params->damping, h * 60.0f);
+    const float invH = 1.0f / h;
+    const float width = params->width;
+    const float height = params->height;
+    const float elasticity = params->elasticity;
+    const int iterations = params->iterations > 0 ? params->iterations : 1;
 
-    for (int i = 0; i < count; i++) {
-        Circle *c = &circles[i];
-
-        // Apply gravity
-        c->vy += gravity * dt;
-
-        // Apply damping (smooth exponential)
-        c->vx *= base_damping;
-        c->vy *= base_damping;
-
-        // Integrate position
-        c->x += c->vx * dt;
-        c->y += c->vy * dt;
-
-        // Velocity clamping for numerical stability
-        const float max_speed = 600.0f;
-        float speed_sq = c->vx * c->vx + c->vy * c->vy;
-        if (speed_sq > max_speed * max_speed) {
-            float scale = max_speed / sqrtf(speed_sq);
-            c->vx *= scale;
-            c->vy *= scale;
+    /* 1. Integrate */
+    {
+        float *pos = c->pos, *vel = c->vel;
+        const float *radius = c->radius;
+        #pragma omp parallel for schedule(static) num_threads(numThreads)
+        for (int i = 0; i < count; i++) {
+            integrate_body(&pos[2 * i], &pos[2 * i + 1], &vel[2 * i], &vel[2 * i + 1], radius[i],
+                           params->gravity, dampingStep, h, width, height, elasticity);
         }
     }
 
-    //---------------------------------------------------------
-    // 2. Collision resolution (iterative constraint solver)
-    //---------------------------------------------------------
-    // Increase iterations for stacking stability
-    int iterations = 10;
-    if (count > 500) iterations = 15;
-    if (count > 2000) iterations = 20;
+    /* 2. Broad phase */
+    if (useGrid) build_grid(s, c->pos, count);
 
-    const float friction = 0.99f;
-
+    /* 3. Jacobi iterations: read c->pos/vel, write s->pos/vel, then swap. */
     for (int iter = 0; iter < iterations; iter++) {
-        //-----------------------
-        // Circle–circle collisions
-        //-----------------------
+        const int last = (iter == iterations - 1) && stats;
+        const float *inPos = c->pos, *inVel = c->vel;
+        const float *radius = c->radius, *invMass = c->invMass;
+        float *outPos = s->pos, *outVel = s->vel;
+
+        /* Statistics go through OpenMP reductions (private per-thread copies),
+           not a shared per-thread array that would false-share a cache line. */
+        float maxPen = 0.0f;
+        double kinetic = 0.0;
+        long contacts = 0;
+
+        #pragma omp parallel for schedule(static) num_threads(numThreads) \
+            reduction(max:maxPen) reduction(+:kinetic) reduction(+:contacts)
         for (int i = 0; i < count; i++) {
-            Circle *a = &circles[i];
-            for (int j = i + 1; j < count; j++) {
-                Circle *b = &circles[j];
-                resolve_collision(a, b, params->elasticity, dt);
+            float x = inPos[2 * i], y = inPos[2 * i + 1];
+            float vx = inVel[2 * i], vy = inVel[2 * i + 1];
+            const float r = radius[i], w = invMass[i];
+
+            ContactAccum acc;
+            contact_accum_reset(&acc);
+
+            if (useGrid) {
+                int cx = cell_coord(x, s->invCellSize, s->gridW);
+                int cy = cell_coord(y, s->invCellSize, s->gridH);
+                for (int ny = cy - 1; ny <= cy + 1; ny++) {
+                    if (ny < 0 || ny >= s->gridH) continue;
+                    for (int nx = cx - 1; nx <= cx + 1; nx++) {
+                        if (nx < 0 || nx >= s->gridW) continue;
+                        int cell = ny * s->gridW + nx;
+                        for (int k = s->cellStart[cell]; k < s->cellStart[cell + 1]; k++) {
+                            int j = s->sortedIdx[k];
+                            if (j == i) continue;
+                            contact_accumulate(&acc, i, x, y, vx, vy, r, w,
+                                               j, inPos[2 * j], inPos[2 * j + 1],
+                                               inVel[2 * j], inVel[2 * j + 1],
+                                               radius[j], invMass[j], elasticity, invH);
+                        }
+                    }
+                }
+            } else {
+                for (int j = 0; j < count; j++) {
+                    if (j == i) continue;
+                    contact_accumulate(&acc, i, x, y, vx, vy, r, w,
+                                       j, inPos[2 * j], inPos[2 * j + 1],
+                                       inVel[2 * j], inVel[2 * j + 1],
+                                       radius[j], invMass[j], elasticity, invH);
+                }
+            }
+
+            contact_apply(&acc, &x, &y, &vx, &vy);
+            apply_walls(&x, &y, &vx, &vy, r, width, height, elasticity);
+
+            outPos[2 * i] = x;
+            outPos[2 * i + 1] = y;
+            outVel[2 * i] = vx;
+            outVel[2 * i + 1] = vy;
+
+            if (last) {
+                maxPen = fmaxf(maxPen, acc.maxPenetration);
+                contacts += acc.contacts;
+                if (w > 0.0f) kinetic += 0.5 * (double)(vx * vx + vy * vy) / (double)w;
             }
         }
 
-        //-----------------------
-        // Boundary constraints
-        //-----------------------
-        for (int i = 0; i < count; i++) {
-            Circle *c = &circles[i];
+        float *tmp = c->pos; c->pos = s->pos; s->pos = tmp;
+        tmp = c->vel; c->vel = s->vel; s->vel = tmp;
 
-            // Left wall
-            if (c->x < c->radius) {
-                c->x = c->radius;
-                if (c->vx < 0) {
-                    c->vx = -c->vx * params->elasticity;
-                    c->vy *= friction;
-                }
-            }
-            // Right wall
-            else if (c->x > params->width - c->radius) {
-                c->x = params->width - c->radius;
-                if (c->vx > 0) {
-                    c->vx = -c->vx * params->elasticity;
-                    c->vy *= friction;
-                }
-            }
-
-            // Bottom wall
-            if (c->y < c->radius) {
-                c->y = c->radius;
-                if (c->vy < 0) {
-                    c->vy = -c->vy * params->elasticity;
-                    c->vx *= friction;
-                }
-            }
-            // Top wall
-            else if (c->y > params->height - c->radius) {
-                c->y = params->height - c->radius;
-                if (c->vy > 0) {
-                    c->vy = -c->vy * params->elasticity;
-                    c->vx *= friction;
-                }
-            }
+        if (last) {
+            stats->maxPenetration = maxPen;
+            stats->kineticEnergy = (float)kinetic;
+            stats->contacts = (uint32_t)(contacts / 2);
         }
     }
 
-    //---------------------------------------------------------
-    // 3. Optional: Sleep low-motion circles (resting optimization)
-    //---------------------------------------------------------
-    // Helps reduce jitter for piles by zeroing small velocities
-    const float sleep_threshold_sq = 0.05f * 0.05f;
-    for (int i = 0; i < count; i++) {
-        float speed_sq = circles[i].vx * circles[i].vx + circles[i].vy * circles[i].vy;
-        if (speed_sq < sleep_threshold_sq) {
-            circles[i].vx = 0.0f;
-            circles[i].vy = 0.0f;
+    /* 4. Sleep near-stationary bodies to stop resting piles from jittering */
+    {
+        float *vel = c->vel;
+        #pragma omp parallel for schedule(static) num_threads(numThreads)
+        for (int i = 0; i < count; i++) {
+            sleep_body(&vel[2 * i], &vel[2 * i + 1]);
         }
+    }
+}
+
+void cpu_solver_step(CpuSolver *s, CircleArrays *c, int count, const SimParams *params,
+                     float dt, int useGrid, int numThreads, SimStats *stats)
+{
+    if (stats) memset(stats, 0, sizeof(*stats));
+    if (count <= 0 || dt <= 0.0f || c->capacity != s->capacity) return;
+    if (numThreads < 1) numThreads = 1;
+
+    const int substeps = params->substeps > 0 ? params->substeps : 1;
+    const float h = dt / (float)substeps;
+    for (int sub = 0; sub < substeps; sub++) {
+        /* Statistics describe the final sub-step */
+        cpu_substep(s, c, count, params, h, useGrid, numThreads,
+                    sub == substeps - 1 ? stats : NULL);
     }
 }

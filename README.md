@@ -1,239 +1,138 @@
 # GPU Circle Collision Simulation
 
-A high-performance 2D circle collision physics simulator leveraging CUDA for GPU acceleration. This project demonstrates the power of parallel computing by simulating thousands of circles with realistic collision detection, gravity, and boundary interactions in real-time.
+A real-time 2D circle physics simulator with matching CPU and CUDA solvers. Both run the same algorithm (a uniform-grid broad phase and a Jacobi-style contact solver with sub-stepping), so the modes can be compared directly, and the GPU path renders through CUDA-OpenGL interop without copying results back to the host.
 
-![Demo](images/demo1.png)
+![CPU mode, 5000 circles](images/demo_cpu_5000.png)
+
+*CPU mode with 5,000 circles on 16 threads (1.8 ms of physics per frame). This capture came from a machine without a CUDA GPU, which is why the GPU modes are greyed out.*
 
 ## Features
 
-- **Three Computation Modes:**
-  - **CPU Mode**: Traditional single-threaded physics computation
-  - **GPU Mode (Copy)**: CUDA-accelerated physics with data transfer via cudaMemcpy
-  - **GPU Mode (Interop)**: CUDA-OpenGL interoperability for zero-copy rendering (when available)
+- **Three modes**, switchable at runtime without losing state:
+  - **CPU**: OpenMP-parallel solver, with a toggle between the spatial grid and an all-pairs O(n²) reference.
+  - **GPU (Copy)**: CUDA solver; render data is copied to pinned host memory and uploaded to OpenGL.
+  - **GPU (Interop)**: CUDA writes render data straight into the OpenGL vertex buffer, so nothing round-trips over PCIe.
+- **Up to 20,000 circles.** Radii scale with the count so the circles fit in the box.
+- **Stable stacking.** Sub-stepping plus Jacobi iterations, a fixed 120 Hz timestep, and sleeping of near-stationary bodies.
+- **Live metrics**: frame rate, host physics time, GPU time from CUDA events, contact count, maximum overlap, and kinetic energy.
+- **Headless benchmark** (`circle_bench`) and a **physics test suite** (`ctest`). Neither needs a window or a GPU.
 
-- **Realistic Physics:**
-  - Circle-to-circle collision detection and response
-  - Boundary collision handling with elasticity
-  - Gravity simulation
-  - Velocity damping
-  - Mass-based dynamics
-  - Iterative constraint solver for stable stacking
+## How it works
 
-- **Interactive Controls:**
-  - Adjustable simulation parameters (gravity, damping, elasticity)
-  - Dynamic circle count (10-5000 circles)
-  - Real-time mode switching
-  - Pause/resume functionality
-  - Performance metrics display
+### Data layout: structure of arrays
 
-- **Optimized Rendering:**
-  - Instanced rendering for efficient GPU utilization
-  - Smooth 60+ FPS with thousands of circles
-  - Colorful visualization with per-circle random colors
+Each circle attribute is its own contiguous array: positions and velocities as `float2`, then radius, inverse mass and colour. A warp reading `pos[i]` for 32 consecutive circles touches one contiguous 256-byte span, so the loads coalesce. With the old array-of-structs layout, every load pulled whole 36-byte structs. On the CPU the arrays are 64-byte aligned, so no two arrays share a cache line.
 
-## Demo
+### Broad phase: spatial hashing with a sorted uniform grid
 
-The simulation handles up to 5000 circles simultaneously with realistic physics interactions:
+The cell size is the largest circle diameter, so every overlapping pair lies in the same or an adjacent cell. Each sub-step on the GPU runs four stages:
 
-<p align="center">
-  <img src="images/demo1.png" alt="Circle Simulation Demo" width="800"/>
-</p>
+1. `k_integrate_hash`, one thread per circle: integrate, then compute the circle's cell id.
+2. `cub::DeviceRadixSort::SortPairs` sorts (cell, index) pairs. It sorts only the bits the largest cell id needs, which means fewer radix passes.
+3. `k_reorder` finds each cell's `[start, end)` range. Each thread compares its key with its neighbour's, with the keys staged in **shared memory** so each is read from global memory once. It then gathers every attribute into cell order.
+4. After the gather, circles in the same cell are adjacent in memory, so each solver thread's neighbour reads hit nearby addresses and the cache.
 
-The screenshot shows 500 circles settling under gravity, demonstrating stable stacking behavior and collision resolution. The UI panel displays real-time performance metrics and control options.
+The CPU builds the same grid with a counting sort. This replaces the old O(n²) all-pairs test.
 
-## Requirements
+### Narrow phase: one thread per circle, no atomics
 
-### System Requirements
-- **NVIDIA GPU** with CUDA support (Compute Capability 7.5 or higher recommended)
-- CUDA Toolkit 11.0 or higher
-- OpenGL 3.3 or higher
-- C++17 compatible compiler
-- CMake 3.18 or higher
+Each thread owns one circle. It scans the 3×3 neighbouring cells and accumulates the position correction and velocity impulse it receives from each contact, then writes **only its own state** to a separate output buffer (Jacobi iteration with double buffering). Because nothing writes to a neighbour, no atomics are needed, there's no write contention, and on the CPU there's no false sharing. The results are also bitwise identical for any CPU thread count, which the tests check.
 
-### Dependencies
-- **GLFW** 3.3.8 - Window and input handling
-- **GLAD** - OpenGL function loader
-- **ImGui** 1.89.9 - User interface
-- **CUDA Toolkit** - GPU computation
+The old version launched one thread per *pair*: O(n²) threads, a binary search per thread to decode the pair index, and `atomicAdd` on both bodies' positions.
 
-## Building from Source
+Jacobi propagates support through a tall stack more slowly than sequential Gauss-Seidel. **Sub-stepping** compensates (Macklin et al., *Small Steps in Physics Simulation*, 2019). Splitting a step into short sub-steps with few iterations each converges much faster than one long step with many iterations. On a 20,000-circle pile at the same total cost, 16 sub-steps × 1 iteration gives a median overlap of 3.5% of the radius, against 30% for 1 × 16 (measured with the CPU solver, which shares the GPU's math in `src/contact.h`).
 
-### 1. Clone the Repository
+### Other GPU optimisations
 
-```bash
-git clone https://github.com/yourusername/gpu-circle-simulation.git
-cd gpu-circle-simulation
-```
-
-### 2. Setup Dependencies
-
-Run the dependency setup script to download GLFW and ImGui:
-
-```bash
-chmod +x setup_dependencies.sh
-./setup_dependencies.sh
-```
-
-**Note:** GLAD requires manual download:
-1. Visit [glad.dav1d.de](https://glad.dav1d.de/)
-2. Configure with these settings:
-   - Language: **C/C++**
-   - Specification: **OpenGL**
-   - API gl: **Version 3.3+**
-   - Profile: **Core**
-   - Generate a loader: **YES**
-3. Download and extract to `external/glad/`
-
-The directory structure should be:
-```
-external/glad/
-├── include/
-│   ├── glad/
-│   │   └── glad.h
-│   └── KHR/
-│       └── khrplatform.h
-└── src/
-    └── glad.c
-```
-
-### 3. Install CUDA Toolkit
-
-**Ubuntu/Debian:**
-```bash
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb
-sudo dpkg -i cuda-keyring_1.0-1_all.deb
-sudo apt-get update
-sudo apt-get install cuda-toolkit-12-0
-```
-
-**Other platforms:** Follow the [official CUDA installation guide](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/).
-
-### 4. Build the Project
-
-```bash
-mkdir build
-cd build
-cmake ..
-make -j$(nproc)
-```
-
-### 5. Run the Simulation
-
-```bash
-./circle_sim
-```
-
-## Project Structure
-
-```
-gpu-circle-simulation/
-├── src/
-│   ├── main.cpp              # Main application loop
-│   ├── physics_cpu.c         # CPU physics implementation
-│   ├── physics_gpu.cu        # CUDA GPU physics kernels
-│   ├── renderer.cpp/h        # OpenGL rendering
-│   ├── ui.cpp/h              # ImGui interface
-│   └── circle.h              # Data structures and API
-├── shaders/
-│   ├── circle.vert           # Vertex shader
-│   └── circle.frag           # Fragment shader
-├── external/                 # Third-party dependencies
-├── images/                   # Demo images
-├── CMakeLists.txt           # Build configuration
-├── setup_dependencies.sh    # Dependency setup script
-└── README.md                # This file
-```
-
-## Usage
-
-### Controls
-
-**UI Panel (left side):**
-- **Mode Selection**: Choose between CPU, GPU (Copy), or GPU (Interop) modes
-- **Circle Count**: Adjust number of simulated circles (10-5000)
-- **Gravity**: Control gravitational acceleration (0-500)
-- **Damping**: Adjust velocity damping (0.9-1.0)
-- **Elasticity**: Set collision bounciness (0.1-1.0)
-- **Paused**: Pause/resume simulation
-- **Reset Simulation**: Reinitialize with new random positions
-
-**Keyboard:**
-- `ESC`: Exit application
-
-### Performance Tips
-
-- **For maximum performance**: Use GPU Mode (Interop) if available
-- **For stability testing**: Use CPU Mode with fewer circles
-- **GPU Mode (Copy)** provides a middle ground with good performance and compatibility
-- Reduce circle count if frame rate drops below 30 FPS
-- Lower damping values create more energetic simulations but may be less stable
-
-## Technical Details
-
-### Physics Implementation
-
-The simulation uses an iterative constraint-based solver with:
-- **Collision Detection**: Efficient O(n²) broad-phase with spatial coherence
-- **Collision Response**: Impulse-based resolution with Baumgarte stabilization
-- **Constraint Iterations**: 10-20 iterations depending on circle count for stable stacking
-- **Position Correction**: Mass-weighted projection to resolve penetrations
-- **Resting Contact**: Velocity threshold for sleeping low-motion circles
-
-### GPU Acceleration
-
-**CUDA Kernels:**
-- `update_positions`: Parallel integration of velocities
-- `detect_resolve_collisions`: Parallel collision detection and response
-- `handle_boundaries`: Parallel boundary constraint enforcement
-
-**Optimization Techniques:**
-- Coalesced memory access patterns
-- Shared memory for collision pairs
-- Thread block optimization for occupancy
-- Optional CUDA-OpenGL interop for zero-copy rendering
+- **CUDA Graphs.** A frame is about 10 kernel launches per sub-step. It's captured once into a graph and replayed, re-captured only when a parameter changes, which removes most of the per-launch CPU overhead.
+- **Warp-shuffle reductions** for the statistics: shuffles within a warp, then one shared-memory slot per warp, then one atomic per block instead of one per thread.
+- **Vectorised stores.** Render data is one 16-byte `float4` per circle (x, y, radius, packed RGBA8): a single coalesced store per thread, in exactly the layout the VBO expects.
+- **`const __restrict__` pointers** and `__launch_bounds__(256)`, which let the compiler use the read-only data path and budget registers. All kernels use 39 registers or fewer with zero spills (`ptxas -v`, sm_86), which allows 100% theoretical occupancy at 256 threads per block.
+- **No host stalls for metrics.** Timing uses CUDA events, and statistics are copied into double-buffered pinned memory and read back one frame later without blocking.
+- **Pinned host memory** for the copy-mode transfer, and all device buffers (including CUB's scratch space) allocated once at start-up.
 
 ### Rendering
 
-- **Instanced rendering**: Single draw call for all circles
-- **Vertex shader**: Per-instance transformations
-- **Fragment shader**: Solid color rendering
-- **Orthographic projection**: 2D screen-space coordinates
+Circles are drawn as instanced quads (4 vertices instead of the old 32-vertex triangle fan). The fragment shader computes an anti-aliased disc, so edges are smooth at any radius. The CPU and copy modes stream into an orphaned buffer; interop mode draws from a separate buffer registered with CUDA, which is never re-specified because that would invalidate the registration.
 
-## Known Limitations
+## Benchmarks
 
-- CUDA-OpenGL interop may not be available on all systems (falls back to GPU Copy mode)
-- Very high circle counts (>3000) may cause frame rate drops on older GPUs
-- macOS support is limited due to CUDA unavailability (CPU mode only)
-- Collision detection is O(n²) and not spatially partitioned
+`circle_bench [count] [steps]` times one 1/120 s step (8 sub-steps × 2 iterations) on a settled pile. Measured on an AMD Ryzen 7 7800X3D (8 cores / 16 threads):
 
-## Future Improvements
+| Solver | 5,000 circles | 20,000 circles |
+|---|---|---|
+| CPU, all pairs O(n²), 1 thread | 349.1 ms | – |
+| CPU, uniform grid, 1 thread | 12.6 ms | 53.6 ms |
+| CPU, uniform grid, 16 threads (OpenMP) | 1.30 ms | 5.80 ms |
+| GPU | run `circle_bench` on a CUDA machine | |
 
-- [ ] Spatial partitioning (grid or quadtree) for better collision performance
-- [ ] Additional physics features (friction, angular velocity)
-- [ ] Interactive mouse interaction (drag circles, add forces)
-- [ ] Parallel collision detection with atomic operations
-- [ ] Compute shader alternative for broader GPU compatibility
-- [ ] Recording and playback functionality
+The grid is **27.8× faster** than all pairs at 5,000 circles, and OpenMP gives a **9.7× speedup** on 16 threads. `circle_bench` prints the GPU row and the GPU-vs-CPU speedups automatically when a CUDA device is present.
+
+## Requirements
+
+- C/C++17 compiler and CMake 3.18+
+- OpenGL 3.3, plus the usual X11 development packages on Linux
+- **Optional:** CUDA Toolkit 12.0+ and an NVIDIA GPU (compute capability 7.5+ by default). Without CUDA the project builds in CPU-only mode.
+- **Optional:** OpenMP (the CPU solver is single-threaded without it)
+- Python 3 (used by the setup script to generate the GLAD loader)
+
+CUDA-OpenGL interop is not supported under WSL2. There the app detects this and uses GPU (Copy) mode.
+
+## Building
+
+```bash
+./setup_dependencies.sh            # clones GLFW + ImGui and generates GLAD into external/
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/circle_sim
+```
+
+Other targets:
+
+```bash
+./build/circle_bench 20000 200     # headless timings (CPU, OpenMP, and GPU if available)
+ctest --test-dir build             # physics tests (no window or GPU needed)
+```
+
+To target a specific GPU, pass e.g. `-DCMAKE_CUDA_ARCHITECTURES=86`. To build only the solver, tests and benchmark without any graphics dependencies, pass `-DCIRCLE_SIM_BUILD_APP=OFF`.
+
+## Project structure
+
+```
+src/
+├── contact.h            # per-body solver math shared by CPU and GPU (host/device inline)
+├── circle.h             # SoA data layout, CPU and GPU solver APIs
+├── physics_cpu.c        # CPU solver: counting-sort grid, OpenMP Jacobi iterations
+├── physics_gpu.cu       # CUDA solver: radix-sort grid, reorder, solve kernels, graphs, interop
+├── physics_gpu_stub.cpp # used when building without CUDA
+├── renderer.cpp/h       # instanced quad rendering with anti-aliased discs
+├── ui.cpp/h             # ImGui controls and metrics
+├── main.cpp             # window, fixed-timestep loop, mode switching
+└── benchmark.cpp        # headless benchmark
+tests/
+└── test_physics_cpu.c   # grid vs brute force, thread determinism, stacking stability
+```
+
+## Tests
+
+`test_physics_cpu` checks that:
+
+- the grid finds exactly the same contacts, with the same result, as the all-pairs reference;
+- results are bitwise identical with 1 thread and with all threads;
+- piles of 500, 5,000 and 20,000 circles settle (finite, in bounds, bounded overlap, kinetic energy under 5% of the initial value);
+- two circles with identical centres are pushed apart.
+
+## Controls
+
+The left panel switches modes and changes the circle count, gravity, damping, elasticity, sub-steps and iterations. It also toggles the CPU grid, sets the thread count, and pauses, resets or toggles vsync. `ESC` quits.
+
+## Known limitations and next steps
+
+- No friction or rotation: circles are smooth discs.
+- The grid is rebuilt every sub-step. Rebuilding less often with a slightly larger cell (a Verlet-list style margin) would cut sort cost.
+- The GPU kernels have been compiled and checked with `ptxas`, and the shared algorithm is covered by the CPU tests. GPU timings depend on the hardware, so run `circle_bench` to measure them.
+- Mouse interaction (dragging circles, applying forces) is not implemented yet.
 
 ## License
 
 This project is open source and available under the MIT License.
-
-## Acknowledgments
-
-- **GLFW** - Window management
-- **ImGui** - Immediate mode GUI
-- **GLAD** - OpenGL loader
-- **NVIDIA CUDA** - GPU computing platform
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Contact
-
-For questions or suggestions, please open an issue on GitHub.
-
----
-
-**Enjoy simulating thousands of bouncing circles! 🔵🟢🔴**
