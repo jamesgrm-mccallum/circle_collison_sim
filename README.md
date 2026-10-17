@@ -2,9 +2,9 @@
 
 A real-time 2D circle physics simulator with matching CPU and CUDA solvers. Both run the same algorithm (a uniform-grid broad phase and a Jacobi-style contact solver with sub-stepping), so the modes can be compared directly, and the GPU path renders through CUDA-OpenGL interop without copying results back to the host.
 
-![CPU mode, 5000 circles](images/demo_cpu_5000.png)
+![GPU mode, 5000 circles](images/demo_gpu_5000.png)
 
-*CPU mode with 5,000 circles on 16 threads (1.8 ms of physics per frame). This capture came from a machine without a CUDA GPU, which is why the GPU modes are greyed out.*
+*GPU (Copy) mode with 5,000 circles on an RTX 3050 Ti Laptop GPU under WSL2, where CUDA-OpenGL interop is unavailable, so the Interop mode is greyed out.*
 
 ## Features
 
@@ -57,16 +57,32 @@ Circles are drawn as instanced quads (4 vertices instead of the old 32-vertex tr
 
 ## Benchmarks
 
-`circle_bench [count] [steps]` times one 1/120 s step (8 sub-steps × 2 iterations) on a settled pile. Measured on an AMD Ryzen 7 7800X3D (8 cores / 16 threads):
+`circle_bench [count] [steps]` times one 1/120 s step (8 sub-steps × 2 iterations) on a settled pile.
+
+**Laptop: RTX 3050 Ti Laptop GPU (sm_86) + Ryzen 9 5900HX (8 cores / 16 threads), WSL2**
+
+| Solver | 5,000 circles | 20,000 circles |
+|---|---|---|
+| CPU, all pairs O(n²), 1 thread | 429.6 ms | – |
+| CPU, uniform grid, 1 thread | 13.2 ms | 67.5 ms |
+| CPU, uniform grid, 8 threads (OpenMP) | 2.34 ms | 12.9 ms |
+| **GPU** | **0.79 ms** | **0.92 ms** |
+
+At 20,000 circles the GPU is **73.6× faster** than one CPU thread and **14.1× faster** than the best multithreaded CPU run (8 threads), at about 1,100 steps per second. The GPU time barely changes from 5,000 to 20,000 circles: at these sizes the fixed cost of about 10 short kernels per sub-step likely outweighs the per-body work. On this laptop 16 threads were slower than 8, probably because the solver hits several barriers per sub-step and SMT siblings stall them under WSL2.
+
+**Desktop: Ryzen 7 7800X3D (8 cores / 16 threads), no CUDA GPU**
 
 | Solver | 5,000 circles | 20,000 circles |
 |---|---|---|
 | CPU, all pairs O(n²), 1 thread | 349.1 ms | – |
 | CPU, uniform grid, 1 thread | 12.6 ms | 53.6 ms |
 | CPU, uniform grid, 16 threads (OpenMP) | 1.30 ms | 5.80 ms |
-| GPU | run `circle_bench` on a CUDA machine | |
 
-The grid is **27.8× faster** than all pairs at 5,000 circles, and OpenMP gives a **9.7× speedup** on 16 threads. `circle_bench` prints the GPU row and the GPU-vs-CPU speedups automatically when a CUDA device is present.
+The grid is **27.8× faster** than all pairs at 5,000 circles, and OpenMP gives a **9.7× speedup** on 16 threads.
+
+The GPU results were also checked against the CPU solver: after one step from the same state, every body's position agrees to within 5×10⁻⁴ px (fast-math rounding), and after 10 simulated seconds both produce piles whose contact counts agree to within 1% and median overlaps to within 3%.
+
+Laptop GPUs drop their clocks when idle. In the windowed app, where the GPU idles between frames, the event-timed step is therefore a few milliseconds rather than the ~0.9 ms measured back to back.
 
 ## Requirements
 
@@ -130,7 +146,6 @@ The left panel switches modes and changes the circle count, gravity, damping, el
 
 - No friction or rotation: circles are smooth discs.
 - The grid is rebuilt every sub-step. Rebuilding less often with a slightly larger cell (a Verlet-list style margin) would cut sort cost.
-- The GPU kernels have been compiled and checked with `ptxas`, and the shared algorithm is covered by the CPU tests. GPU timings depend on the hardware, so run `circle_bench` to measure them.
 - Mouse interaction (dragging circles, applying forces) is not implemented yet.
 
 ## License

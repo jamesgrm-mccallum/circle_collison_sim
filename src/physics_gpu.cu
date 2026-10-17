@@ -104,6 +104,8 @@ struct GpuState {
     cudaEvent_t  evDone[2] = {};
     bool         pending[2] = {};
     unsigned     frame = 0;
+    GpuFrameStats carried{};        // a finished frame's stats, kept when its slot is reused unpolled
+    bool          carriedValid = false;
 
     // One cached graph per starting buffer parity
     GraphEntry graphs[4];
@@ -655,12 +657,32 @@ void physics_gpu_download(CircleArrays *c, int count)
     CUDA_CHECK(cudaMemcpy(c->color, g.color[g.attrCur], sizeof(uint32_t) * n, cudaMemcpyDeviceToHost));
 }
 
+// Reads a finished frame's statistics. Its evDone must have completed.
+static void read_stats(int slot, GpuFrameStats *out)
+{
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, g.evStart[slot], g.evStop[slot]);
+    out->sim = *g.hStats[slot];
+    out->sim.contacts /= 2;   // every contact is counted by both bodies
+    out->stepMs = ms;
+}
+
 void physics_gpu_step(const SimParams *params, float dt, GpuOutput output)
 {
     if (!g.initialized || g.count <= 0 || dt <= 0.0f) return;
     if (output == GPU_OUTPUT_VBO && !g.vboResource) output = GPU_OUTPUT_HOST;
 
+    // At most two frames in flight: before reusing a slot, wait for the frame that
+    // last used it. This bounds how far the host runs ahead (latency) and keeps
+    // that frame's stats instead of overwriting them unread.
     const int slot = static_cast<int>(g.frame & 1u);
+    if (g.pending[slot]) {
+        if (CUDA_CHECK(cudaEventSynchronize(g.evDone[slot]))) {
+            read_stats(slot, &g.carried);
+            g.carriedValid = true;
+        }
+        g.pending[slot] = false;
+    }
     cudaEventRecord(g.evStart[slot], g.stream);
 
     run_frame(*params, dt);
@@ -701,6 +723,11 @@ bool physics_gpu_poll_stats(GpuFrameStats *out)
 {
     if (!g.initialized) return false;
     bool found = false;
+    if (g.carriedValid) {
+        *out = g.carried;
+        g.carriedValid = false;
+        found = true;
+    }
     // Oldest first, so the newest finished frame wins.
     for (unsigned back = 2; back >= 1; back--) {
         if (g.frame < back) continue;
@@ -716,11 +743,7 @@ bool physics_gpu_poll_stats(GpuFrameStats *out)
             g.pending[slot] = false;
             continue;
         }
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, g.evStart[slot], g.evStop[slot]);
-        out->sim = *g.hStats[slot];
-        out->sim.contacts /= 2;   // every contact is counted by both bodies
-        out->stepMs = ms;
+        read_stats(slot, out);
         g.pending[slot] = false;
         found = true;
     }
